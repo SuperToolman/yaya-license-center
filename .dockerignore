@@ -1,0 +1,12 @@
+.git
+node_modules
+**/node_modules
+web/.next
+api/target
+api/*.sqlite
+api/*.sqlite3
+api/*.log
+secrets
+deploy/secrets
+deploy/.env
+web/pnpm-lock.yaml

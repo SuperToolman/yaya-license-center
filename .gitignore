@@ -1,0 +1,28 @@
+# Secrets and local configuration
+secrets/
+deploy/secrets/
+deploy/.env
+*.pem
+*token*.txt
+
+# Runtime data and logs
+*.sqlite3
+*.sqlite3-*
+.license-center-licenses.json
+.license-center-revocations.json
+*.log
+
+# Rust
+api/target/
+
+# Node / Next.js
+node_modules/
+web/node_modules/
+web/.next/
+web/tsconfig.tsbuildinfo
+
+# Editor and operating system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

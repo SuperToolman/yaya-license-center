@@ -1,0 +1,7 @@
+{
+  "name": "yaya-license-center-web",
+  "private": true,
+  "scripts": { "dev": "next dev --port 8778", "build": "next build", "lint": "eslint ." },
+  "dependencies": { "next": "16.0.0", "react": "19.2.0", "react-dom": "19.2.0" },
+  "devDependencies": { "@types/node": "^20", "@types/react": "^19", "@types/react-dom": "^19", "typescript": "^5" }
+}

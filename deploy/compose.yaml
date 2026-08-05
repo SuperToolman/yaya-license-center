@@ -1,0 +1,30 @@
+name: yaya-license-center
+
+services:
+  license-center:
+    container_name: ${CONTAINER_NAME:?set CONTAINER_NAME in deploy/.env or publish.ps1}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        CARGO_REGISTRIES_CRATES_IO_INDEX: ${CARGO_REGISTRIES_CRATES_IO_INDEX:-sparse+https://rsproxy.cn/index/}
+    restart: unless-stopped
+    environment:
+      LICENSE_CENTER_HOST: 0.0.0.0
+      LICENSE_CENTER_PORT: 8779
+      LICENSE_CENTER_DB_PATH: /var/lib/yaya-license-center/license-center.sqlite3
+    ports:
+      - "${WEB_PORT:-8778}:8778"
+      - "${API_PORT:-8779}:8779"
+    volumes:
+      - license-center-data:/var/lib/yaya-license-center
+      - ./secrets:/run/secrets:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8779/healthz >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+
+volumes:
+  license-center-data:
+    name: ${CONTAINER_NAME:?set CONTAINER_NAME}-data
