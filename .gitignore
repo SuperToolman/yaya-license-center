@@ -8,12 +8,15 @@ deploy/.env
 # Runtime data and logs
 *.sqlite3
 *.sqlite3-*
+*.sqlite3.*
 .license-center-licenses.json
 .license-center-revocations.json
 *.log
 
 # Rust
 api/target/
+api/runtime/
+api/avatars/
 
 # Node / Next.js
 node_modules/

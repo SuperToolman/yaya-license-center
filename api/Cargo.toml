@@ -1,10 +1,10 @@
 [package]
-name = "yaya-license-center-api"
-version = "0.1.0"
+name = "yaya-operation-center-api"
+version = "0.1.5"
 edition = "2024"
 
 [dependencies]
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "multipart"] }
 chrono = { version = "0.4", features = ["clock", "serde"] }
 jsonwebtoken = "9"
 serde = { version = "1", features = ["derive"] }
@@ -13,3 +13,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 uuid = { version = "1", features = ["v4"] }
+zip = "4"
+argon2 = "0.5"
+password-hash = "0.5"

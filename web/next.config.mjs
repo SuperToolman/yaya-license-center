@@ -4,7 +4,7 @@ const nextConfig = {
   async rewrites() {
     return [
       {
-        source: "/license-api/:path*",
+        source: "/operation-api/:path*",
         destination: "http://127.0.0.1:8779/:path*",
       },
     ];

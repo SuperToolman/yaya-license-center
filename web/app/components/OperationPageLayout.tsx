@@ -1,0 +1,2 @@
+import OperationSidebar from "./OperationSidebar";
+export default function OperationPageLayout({ children }: { children: React.ReactNode }) { return <main className="operation-shell grid min-h-screen grid-cols-[224px_minmax(0,1fr)]"><OperationSidebar /><section className="operation-main min-w-0 px-4 py-7 sm:px-8 lg:px-10"><div className="mx-auto w-full max-w-[1440px]">{children}</div></section></main>; }

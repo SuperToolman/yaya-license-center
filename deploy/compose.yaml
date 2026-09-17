@@ -1,8 +1,9 @@
-name: yaya-license-center
+name: yaya-operation-center
 
 services:
-  license-center:
+  operation-center:
     container_name: ${CONTAINER_NAME:?set CONTAINER_NAME in deploy/.env or publish.ps1}
+    image: yaya-operation-center:latest
     build:
       context: ..
       dockerfile: deploy/Dockerfile
@@ -10,14 +11,16 @@ services:
         CARGO_REGISTRIES_CRATES_IO_INDEX: ${CARGO_REGISTRIES_CRATES_IO_INDEX:-sparse+https://rsproxy.cn/index/}
     restart: unless-stopped
     environment:
-      LICENSE_CENTER_HOST: 0.0.0.0
-      LICENSE_CENTER_PORT: 8779
-      LICENSE_CENTER_DB_PATH: /var/lib/yaya-license-center/license-center.sqlite3
+      YAYA_OPERATION_CENTER_HOST: 0.0.0.0
+      YAYA_OPERATION_CENTER_PORT: 8779
+      YAYA_OPERATION_CENTER_DB_PATH: /var/lib/yaya-operation-center/operation-center.sqlite3
+      YAYA_OPERATION_CENTER_SKILLS_DIR: /var/lib/yaya-operation-center/skills
+      YAYA_OPERATION_CENTER_WEB_ORIGIN: ${WEB_ORIGIN:-}
     ports:
       - "${WEB_PORT:-8778}:8778"
       - "${API_PORT:-8779}:8779"
     volumes:
-      - license-center-data:/var/lib/yaya-license-center
+      - operation-center-data:/var/lib/yaya-operation-center
       - ./secrets:/run/secrets:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8779/healthz >/dev/null"]
@@ -26,5 +29,5 @@ services:
       retries: 6
 
 volumes:
-  license-center-data:
+  operation-center-data:
     name: ${CONTAINER_NAME:?set CONTAINER_NAME}-data

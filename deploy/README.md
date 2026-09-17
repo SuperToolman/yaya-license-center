@@ -1,23 +1,23 @@
-# License Center Deployment
+# Yaya Operation Center Deployment
 
-`secrets/` must contain `private.pem`, `public.pem`, and `admin-token.txt`. Do not commit these files.
+`secrets/` must contain `private.pem`, `public.pem`, and `admin-password.txt`. Do not commit these files. When migrating from the legacy license center, `admin-token.txt` can be retained temporarily: the initialization script uses it as the initial `admin` password and uploads it under the new filename.
 
 First deployment uploads the local `secrets/` directory:
 
 ```powershell
-.\deploy\publish.ps1 -ServerIp 203.0.113.10 -SshUser root -ContainerName yaya-license-center -Initialize
+.\deploy\publish.ps1 -ServerIp 203.0.113.10 -SshUser root -ContainerName yaya-operation-center -Initialize
 ```
 
 Later deployments retain the remote secrets and SQLite Docker volume:
 
 ```powershell
-.\deploy\publish.ps1 -ServerIp 203.0.113.10 -SshUser root -ContainerName yaya-license-center
+.\deploy\publish.ps1 -ServerIp 203.0.113.10 -SshUser root -ContainerName yaya-operation-center
 ```
 
-Set `WEB_PORT` or `API_PORT` in remote `deploy/.env` when the default ports are unavailable. The platform must use the API address, for example `http://47.112.107.44:8779`, not the management UI address on `8778`.
+Use `-WebPort` and `-ApiPort` when the default ports are unavailable. On first initialization, the script creates `WEB_ORIGIN` from the server address; pass `-WebOrigin https://operation.example.com` when the management UI is behind a domain or reverse proxy. Later deployments preserve `WEB_ORIGIN` and `CARGO_REGISTRIES_CRATES_IO_INDEX` from the remote `deploy/.env`. The customer platform must use the API address, for example `http://47.112.107.44:8779`, rather than the management UI address on `8778`.
 
-默认远端目录为 `/opt/yaya-license-center-service`，与低代码平台部署目录隔离。除非明确迁移已有许可证中心，不要将 `-RemoteDir` 指向低代码平台的部署目录。
+The default remote directory is `/opt/yaya-operation-center-service`, isolated from the customer delivery platform. The Docker Compose project and default container name are both `yaya-operation-center`.
 
-许可证中心固定使用 Docker Compose 项目 `yaya-license-center`，且发布不会使用 `--remove-orphans`。因此不会将低代码平台容器识别为孤儿容器或删除。首次升级到此部署逻辑时，脚本只会重建名称与 `-ContainerName` 一致、并带有 `license-center` 服务标签的旧许可证中心容器，以切换到独立项目；其 SQLite 数据卷会保留。
+When migrating an existing deployment, first back up its SQLite volume, then publish with the existing legacy container name so the named volume is retained. The entrypoint copies the legacy `license-center.sqlite3` database to `operation-center.sqlite3` before applying migrations. Legacy `LICENSE_CENTER_*` environment variables and existing JWT issuers remain supported during the transition.
 
-构建时默认通过 `rsproxy` 拉取 Rust 依赖，并在 45 秒网络超时后重试两次。可在服务器 `deploy/.env` 设置 `CARGO_REGISTRIES_CRATES_IO_INDEX` 覆盖为可访问的内部镜像。
+Rust dependencies use the `rsproxy` sparse index by default with two retries after a 45-second network timeout. Set `CARGO_REGISTRIES_CRATES_IO_INDEX` in remote `deploy/.env` to use an internal mirror. Each release replaces the remote application source while retaining `deploy/.env`, `deploy/secrets`, and the SQLite Docker volume.
