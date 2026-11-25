@@ -1,2 +1,4 @@
-import ProviderPortal from "../components/provider-portal";
-export default function ProviderPortalPage() { return <ProviderPortal />; }
+import ProviderPortal from "./components/ProviderPortal";
+export default function ProviderPortalPage() {
+  return <ProviderPortal />;
+}

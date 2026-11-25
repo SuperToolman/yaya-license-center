@@ -4,15 +4,39 @@ version = "0.1.5"
 edition = "2024"
 
 [dependencies]
-axum = { version = "0.8", features = ["macros", "multipart"] }
+yaya-ops-protocol = { path = "../crates/ops-protocol", features = ["unix-http"] }
+axum = { version = "0.8", features = ["macros", "multipart", "ws"] }
 chrono = { version = "0.4", features = ["clock", "serde"] }
 jsonwebtoken = "9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 uuid = { version = "1", features = ["v4"] }
 zip = "4"
+tar = "0.4"
+sha2 = "0.10"
 argon2 = "0.5"
 password-hash = "0.5"
+
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
+aes-gcm = "0.10"
+fs2 = "0.4"
+cap-std = "3"
+
+futures-util = "0.3"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

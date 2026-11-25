@@ -3,3 +3,6 @@ packages:
 
 allowBuilds:
   sharp: true
+  unrs-resolver: false
+patchedDependencies:
+  tailwind-variants@3.3.1: web/patches/tailwind-variants@3.3.1.patch

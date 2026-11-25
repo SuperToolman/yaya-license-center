@@ -1,0 +1,26 @@
+diff --git a/dist/chunk-AUQ4UGQK.js b/dist/chunk-AUQ4UGQK.js
+index 60ca0c521c55302782da2753c7bf723d5546a155..25f392c0fea2d83f2792d1cdc67e4d50608813b7 100644
+--- a/dist/chunk-AUQ4UGQK.js
++++ b/dist/chunk-AUQ4UGQK.js
+@@ -636,6 +636,8 @@ var createSlotsResolver = (resolved, cn) => {
+ };
+ var createClassResolver = (resolved, cn) => {
+   if (resolved.mode === "plain") return createPlainResolver(resolved, cn);
++  // Slot functions are retained by React useMemo: each call must capture its own props.
++  if (resolved.mode === "slots") return (props) => createSlotsResolver(resolved, cn)(props);
+   let resolver;
+   return ((props) => {
+     resolver ??= resolved.mode === "slots" ? createSlotsResolver(resolved, cn) : createVariantResolver(resolved, cn);
+diff --git a/dist/chunk-ICHZ2N3R.cjs b/dist/chunk-ICHZ2N3R.cjs
+index 00765f3aa06b2056a4669dac7b55d9d87d7e1639..29e9a6774f31624e28672aa85c9fbeed3a69288d 100644
+--- a/dist/chunk-ICHZ2N3R.cjs
++++ b/dist/chunk-ICHZ2N3R.cjs
+@@ -638,6 +638,8 @@ var createSlotsResolver = (resolved, cn) => {
+ };
+ var createClassResolver = (resolved, cn) => {
+   if (resolved.mode === "plain") return createPlainResolver(resolved, cn);
++  // Slot functions are retained by React useMemo: each call must capture its own props.
++  if (resolved.mode === "slots") return (props) => createSlotsResolver(resolved, cn)(props);
+   let resolver;
+   return ((props) => {
+     resolver ??= resolved.mode === "slots" ? createSlotsResolver(resolved, cn) : createVariantResolver(resolved, cn);

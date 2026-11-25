@@ -1,0 +1,9 @@
+# YAYA_INSTALL_ROOT=@ROOT@
+[Unit]
+Description=Yaya Operations Platform
+Requires=yaya-host-monitor.service yaya-file-agent.service yaya-operation-center-api.service yaya-operation-center-web.service
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Install]
+WantedBy=multi-user.target

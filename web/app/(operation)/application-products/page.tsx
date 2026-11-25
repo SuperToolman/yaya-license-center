@@ -1,2 +1,4 @@
-import { ApplicationProductsPage } from "../shared/components/ReadPages";
-export default ApplicationProductsPage;
+import ApplicationProductsPage from "./components/ApplicationProductsPage";
+export default function Page() {
+  return <ApplicationProductsPage />;
+}

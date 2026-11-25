@@ -1,0 +1,9 @@
+# Legacy deployment reference; not used by the native host publisher.
+# Connect the operation center to this host's Docker, used for customer platform deployment.
+services:
+  operation-center:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      YAYA_PLATFORM_DOCKER_CLI: /usr/local/bin/docker
+      YAYA_PLATFORM_LICENSE_CENTER_URL: ${YAYA_PLATFORM_LICENSE_CENTER_URL:-http://host.docker.internal:${API_PORT:-8779}}

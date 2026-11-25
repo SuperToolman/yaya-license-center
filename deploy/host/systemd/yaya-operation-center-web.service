@@ -1,0 +1,21 @@
+# YAYA_INSTALL_ROOT=@ROOT@
+[Unit]
+Description=Yaya Operations Management UI
+PartOf=yaya-operation-center.target
+Requires=yaya-operation-center-api.service
+After=yaya-operation-center-api.service
+
+[Service]
+Type=simple
+User=yaya-operation-center
+Group=yaya-operation-center
+WorkingDirectory=@ROOT@/current/web
+EnvironmentFile=@ROOT@/shared/operation-center.env
+Environment=HOSTNAME=0.0.0.0
+ExecStart=@NODE@ @ROOT@/current/web/web/server.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=control-group
+UMask=0027
+NoNewPrivileges=true

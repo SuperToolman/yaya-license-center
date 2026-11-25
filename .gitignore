@@ -15,13 +15,25 @@ deploy/.env
 
 # Rust
 api/target/
+host-monitor/target/
+crates/ops-protocol/target/
+crates/ops-protocol/Cargo.lock
 api/runtime/
 api/avatars/
+api/platform-packages/
+__pycache__/
+*.build-worker.lock
+**/.platform-environment.key
 
 # Node / Next.js
 node_modules/
 web/node_modules/
 web/.next/
+web/.next-test/
+web/.next-build/
+web/test-results/
+web/playwright-report/
+web/.patches/
 web/tsconfig.tsbuildinfo
 
 # Editor and operating system files

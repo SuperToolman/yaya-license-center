@@ -1,2 +1,5 @@
-import LicensesPage from "./components/LicensesPage";
-export default LicensesPage;
+import { redirect } from "next/navigation";
+
+export default function LicensesPage() {
+  redirect("/customers");
+}

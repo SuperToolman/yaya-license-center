@@ -1,0 +1,20 @@
+[package]
+name = "yaya-host-monitor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+yaya-ops-protocol = { path = "../crates/ops-protocol", features = ["unix-http"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nvml-wrapper = "0.11"

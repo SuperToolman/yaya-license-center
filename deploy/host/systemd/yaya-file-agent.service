@@ -1,0 +1,26 @@
+# YAYA_INSTALL_ROOT=@ROOT@
+[Unit]
+Description=Yaya Local File Operations
+PartOf=yaya-operation-center.target
+Before=yaya-operation-center-api.service
+After=local-fs.target
+
+[Service]
+Type=simple
+User=root
+Group=yaya-operation-center
+WorkingDirectory=/
+EnvironmentFile=@ROOT@/shared/file-agent.env
+ExecStart=@ROOT@/current/bin/yaya-operation-center-api --file-agent
+RuntimeDirectory=yaya-file-agent
+RuntimeDirectoryMode=0750
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=45
+KillMode=control-group
+UMask=0027
+NoNewPrivileges=true
+# Filesystem access only: no network administration, mount, ptrace or process control.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_CHOWN
+RestrictAddressFamilies=AF_UNIX
+LimitNOFILE=4096

@@ -13,158 +13,38 @@
   --overlay-shadow: 0 16px 40px rgb(15 23 42 / 16%);
 }
 
-* {
-  box-sizing: border-box;
-  letter-spacing: 0;
+.sidebar-navigation {
   scrollbar-width: none;
-  -ms-overflow-style: none;
 }
 
-/* Keep scrolling available while hiding native scrollbar chrome globally. */
-
-*::-webkit-scrollbar {
-  width: 0;
-  height: 0;
+.sidebar-navigation::-webkit-scrollbar {
+  display: none;
 }
 
-html,
-body {
-  min-height: 100%;
-}
-
-.operation-main {
-  background: var(--background);
-}
-
-.modal__dialog {
-  background-color: var(--background);
-}
-
-/* Keep the overlay visible without washing semantic chip colors into green. */
-.modal__backdrop--opaque,
-.drawer__backdrop--opaque {
-  background-color: rgb(15 23 42 / 18%);
-}
-
-.modal__dialog .input,
-.modal__dialog .textarea,
-.modal__dialog .select,
-.modal__dialog .select__trigger {
-  width: 100%;
-  min-width: 0;
-}
-
-.license-card {
-  --license-card-accent: var(--accent);
-  border: 1px solid var(--border);
-  box-shadow: 0 8px 20px rgb(15 23 42 / 7%);
-}
-
-.license-card--running {
-  --license-card-accent: var(--success);
-}
-
-.license-card--expired,
-.license-card--destroyed {
-  --license-card-accent: var(--danger);
-}
-
-.license-card--legacy {
-  --license-card-accent: var(--warning);
-}
-
-.license-card__header {
-  border-inline-start: 4px solid var(--license-card-accent);
-}
-
-.license-card__mark {
-  color: var(--license-card-accent);
-  background: color-mix(in oklab, var(--license-card-accent) 14%, transparent);
-}
-
-.license-card__facts > div {
-  min-width: 0;
-  padding: 0.625rem 1rem;
-}
-
-.license-card__facts dt {
-  font-size: 0.6875rem;
-}
-
-.license-card__facts dd {
-  margin-top: 0.125rem;
-  font-size: 0.75rem;
-}
-
-.license-card__entitlements .entitlement-list__rows {
-  max-height: 11.25rem;
-  overflow-y: auto;
-  scrollbar-gutter: stable;
-}
-
-body {
-  margin: 0;
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, "Microsoft YaHei", sans-serif;
-}
-
-.modal__dialog--cover {
-  width: min(60vw, 960px);
-  min-height: 0;
-  height: auto;
-  max-height: calc(var(--visual-viewport-height) - 5rem);
-}
-
-.modal__dialog {
-  /* Employee editor contains wide policy controls; keep its size independent
-     of switch/checkbox state and intrinsic child widths. */
-  width: min(60vw, 960px) !important;
-  min-width: min(60vw, 960px);
-}
-
-.employee-modal-content {
-  width: 100%;
-  min-width: 0;
-}
-
-/* Trigger the avatar hint only while the avatar button itself is hovered.
-   Avoid Tailwind group selectors, which can inherit a table-row hover state. */
-.avatar-trigger:hover .avatar-trigger__overlay {
-  background-color: rgb(0 0 0 / 55%);
-  opacity: 1;
-}
-
-@media (max-width: 760px) {
-  .operation-shell {
-    display: block;
+/* Keep native details semantics while animating both opening and closing. */
+@supports (interpolate-size: allow-keywords) {
+  .sidebar-group {
+    interpolate-size: allow-keywords;
   }
 
-  .operation-sidebar {
-    position: static;
-    width: 100%;
-    height: auto;
+  .sidebar-group::details-content {
+    block-size: 0;
+    opacity: 0;
+    overflow: clip;
+    transition:
+      block-size 200ms ease-out,
+      opacity 200ms ease-out,
+      content-visibility 200ms allow-discrete;
   }
 
-  .operation-nav-group {
-    flex-direction: row;
-    align-items: center;
+  .sidebar-group[open]::details-content {
+    block-size: auto;
+    opacity: 1;
   }
 
-  .operation-nav-label {
-    padding-top: 0;
-    padding-bottom: 0;
-    white-space: nowrap;
+  @media (prefers-reduced-motion: reduce) {
+    .sidebar-group::details-content {
+      transition: none;
+    }
   }
-
-  .modal__dialog--cover {
-    width: 100%;
-    max-height: calc(var(--visual-viewport-height) - 2rem);
-  }
-
-  .modal__dialog {
-    width: 100%;
-    min-width: 0;
-  }
-
 }

@@ -1,0 +1,21 @@
+# YAYA_INSTALL_ROOT=@ROOT@
+[Unit]
+Description=Yaya Operations API
+PartOf=yaya-operation-center.target
+Requires=yaya-host-monitor.service yaya-file-agent.service
+After=network-online.target docker.service yaya-host-monitor.service yaya-file-agent.service
+
+[Service]
+Type=simple
+User=yaya-operation-center
+Group=yaya-operation-center
+SupplementaryGroups=@DOCKER_GROUP@
+WorkingDirectory=@ROOT@/shared/data
+EnvironmentFile=@ROOT@/shared/operation-center.env
+ExecStart=@ROOT@/current/bin/run-api.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+KillMode=control-group
+UMask=0027
+NoNewPrivileges=true

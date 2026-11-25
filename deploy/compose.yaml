@@ -1,3 +1,4 @@
+# Legacy deployment reference; publish.ps1 now installs native systemd services.
 name: yaya-operation-center
 
 services:
@@ -16,6 +17,12 @@ services:
       YAYA_OPERATION_CENTER_DB_PATH: /var/lib/yaya-operation-center/operation-center.sqlite3
       YAYA_OPERATION_CENTER_SKILLS_DIR: /var/lib/yaya-operation-center/skills
       YAYA_OPERATION_CENTER_WEB_ORIGIN: ${WEB_ORIGIN:-}
+      ALIYUN_ACCESS_KEY_ID: ${ALIYUN_ACCESS_KEY_ID:-}
+      ALIYUN_ACCESS_KEY_SECRET: ${ALIYUN_ACCESS_KEY_SECRET:-}
+      ALIYUN_SMS_SIGN_NAME: ${ALIYUN_SMS_SIGN_NAME:-}
+      ALIYUN_SMS_LOGIN_TEMPLATE_CODE: ${ALIYUN_SMS_LOGIN_TEMPLATE_CODE:-}
+      ALIYUN_SMS_CODE_PARAM: ${ALIYUN_SMS_CODE_PARAM:-code}
+      ALIYUN_SMS_REGION: ${ALIYUN_SMS_REGION:-cn-hangzhou}
     ports:
       - "${WEB_PORT:-8778}:8778"
       - "${API_PORT:-8779}:8779"

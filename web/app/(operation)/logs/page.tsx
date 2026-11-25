@@ -1,2 +1,4 @@
-import { LogsPage } from "../shared/components/ReadPages";
-export default LogsPage;
+import LogsPage from "./components/LogsPage";
+export default function Page() {
+  return <LogsPage />;
+}

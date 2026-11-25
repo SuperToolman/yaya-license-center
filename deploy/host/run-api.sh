@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+: "${YAYA_OPERATION_CENTER_RELEASE_DIR:?missing release directory}"
+: "${YAYA_OPERATION_CENTER_SECRETS_DIR:?missing secrets directory}"
+export LICENSE_SIGNING_PRIVATE_KEY_PEM="$(cat "$YAYA_OPERATION_CENTER_SECRETS_DIR/private.pem")"
+export LICENSE_SIGNING_PUBLIC_KEY_PEM="$(cat "$YAYA_OPERATION_CENTER_SECRETS_DIR/public.pem")"
+export YAYA_OPERATION_CENTER_INITIAL_ADMIN_PASSWORD="$(cat "$YAYA_OPERATION_CENTER_SECRETS_DIR/admin-password.txt")"
+if [ -x "$YAYA_OPERATION_CENTER_RELEASE_DIR/bin/makensis" ]; then
+  export YAYA_DESKTOP_MAKENSIS="$YAYA_OPERATION_CENTER_RELEASE_DIR/bin/makensis"
+fi
+exec "$YAYA_OPERATION_CENTER_RELEASE_DIR/bin/yaya-operation-center-api"

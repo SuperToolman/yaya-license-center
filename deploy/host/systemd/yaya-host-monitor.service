@@ -1,0 +1,22 @@
+# YAYA_INSTALL_ROOT=@ROOT@
+[Unit]
+Description=Yaya Host Resource Monitor
+PartOf=yaya-operation-center.target
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+User=yaya-operation-center
+Group=yaya-operation-center
+SupplementaryGroups=@DOCKER_GROUP@
+WorkingDirectory=@ROOT@/shared/monitor
+EnvironmentFile=@ROOT@/shared/operation-center.env
+RuntimeDirectory=yaya-host-monitor
+RuntimeDirectoryMode=0750
+ExecStart=@ROOT@/current/bin/yaya-host-monitor
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=control-group
+UMask=0027
+NoNewPrivileges=true

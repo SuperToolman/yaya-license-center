@@ -25,20 +25,20 @@ Yaya Operation Center 是一个独立部署的运营管理平台。它提供受�
 - 服务商管理、订单归属、提成规则、返利台账和结算批次
 - AI 员工头像裁剪上传，并在运营端和市场目录展示
 - SQLite 持久化，并可自动迁移旧版 JSON 记录
-- Docker Compose 部署，数据卷和密钥与应用代码分离
+- Linux 宿主机统一部署，API、管理台与主机监控由 systemd 托管，持久数据和密钥与程序分离
 
 ## 技术栈
 
 - API：Rust、Axum、SQLite（rusqlite）、jsonwebtoken
 - 管理台：Next.js、React、TypeScript、HeroUI、Tailwind CSS 4
-- 部署：Docker、Docker Compose
+- 平台部署：Linux、systemd；客户低代码平台运行环境：Docker
 
 ## 项目结构
 
 ```text
 api/        Rust API 服务
 web/        Next.js 运营管理台
-deploy/     Docker Compose、镜像构建和远程发布脚本
+deploy/     宿主机安装、升级与恢复脚本；旧 Docker 文件作为历史参考
 secrets/    本地开发或首次部署所需密钥（不会提交）
 ```
 
@@ -124,7 +124,11 @@ AI 员工市场测试购买接口使用平台当前许可证作为 Bearer Token�
 | `GET` | `/healthz` | 服务健康检查 |
 | `POST` | `/api/session` | 使用账号密码创建会话 |
 | `GET` | `/api/session` | 查询当前会话状态 |
-| `GET / POST` | `/api/users` | 平台超级管理员列出或创建固定角色账号 |
+| `GET` | `/api/users` | 平台管理员、运营和财务查看账号列表 |
+| `POST` | `/api/users` | 超级管理员创建固定角色账号 |
+| `PUT` | `/api/users/{user_id}` | 超级管理员编辑姓名、角色、组织，可选重置密码 |
+| `POST` | `/api/users/{user_id}/status` | 超级管理员启用或停用账号，停用立即撤销会话 |
+| `DELETE` | `/api/users/{user_id}` | 超级管理员删除已停用账号及其会话，保留业务历史 |
 | `POST` | `/api/licenses` | 按 `orderId` 从已回款订单签发许可证 |
 | `GET` | `/api/licenses` | 列出许可证 |
 | `GET / POST` | `/api/customers` | 列出或创建客户 |
@@ -154,18 +158,18 @@ AI 员工市场测试购买接口使用平台当前许可证作为 Bearer Token�
 | `GET` | `/api/licenses/{license_id}/status` | 校验许可证状态，并在存在同主体更新时返回最新许可证及版本元数据 |
 | `POST` | `/api/licenses/{license_id}/destroy` | 永久销毁许可证 |
 
-## Docker 部署
+## Linux 宿主机部署
 
 首次部署会上传本地 `secrets/` 目录中的密钥和管理员令牌：
 
 ```powershell
-.\deploy\publish.ps1 -ServerIp 203.0.113.10 -SshUser root -ContainerName yaya-operation-center -Initialize
+.\deploy\publish.ps1 -ServerIp 203.0.113.10 -SshUser root -Initialize
 ```
 
-后续发布会保留服务器上的密钥与 SQLite 数据卷：
+后续发布覆盖更新宿主机程序和服务，保留密钥与持久业务数据：
 
 ```powershell
-.\deploy\publish.ps1 -ServerIp 203.0.113.10 -SshUser root -ContainerName yaya-operation-center
+.\deploy\publish.ps1 -ServerIp 203.0.113.10 -SshUser root
 ```
 
 默认将管理台暴露在 `8778`，API 暴露在 `8779`。可通过 `-WebPort` 和 `-ApiPort` 调整。低代码平台应配置 API 地址，例如 `http://example.com:8779`，而不是管理台地址。
@@ -174,10 +178,10 @@ AI 员工市场测试购买接口使用平台当前许可证作为 Bearer Token�
 
 ## 数据与安全
 
-- 许可证数据默认保存为 SQLite 文件；容器部署时保存到独立 Docker 数据卷。
+- 许可证数据保存为 SQLite 文件；宿主机部署时持久化在安装目录下的 `shared/data`，覆盖升级前停服备份。
 - 若旧版 `.license-center-licenses.json` 和 `.license-center-revocations.json` 存在，服务会在首次启动时导入它们。
 - `secrets/`、数据库、日志及运行时构建文件均已加入 `.gitignore`；AI 员工头像和 Skill 包应由持久化运行时目录管理。
-- 生产环境请使用 HTTPS，安全保管私钥与管理员令牌，并定期备份 SQLite 数据卷。
+- 生产环境请使用 HTTPS，安全保管私钥与管理员令牌，并定期备份宿主机持久数据。
 - 审计日志不保存请求体、Authorization 或 Cookie；JSON 返回结果最多保存 32 KB，并自动脱敏许可证正文、Token、密码、API Key 和密钥字段。日志默认最多保留 90 天和 50,000 条记录。
 - 日志中的 IP 用于安全审计和异常排查。若部署在反向代理后，应在代理层做好访问控制和 TLS 终止，不要直接把管理 API 暴露到公网。
 

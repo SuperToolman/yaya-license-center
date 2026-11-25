@@ -1,2 +1,4 @@
-import { UsersPage } from "../shared/components/ReadPages";
-export default UsersPage;
+import UsersPage from "./components/UsersPage";
+export default function Page() {
+  return <UsersPage />;
+}

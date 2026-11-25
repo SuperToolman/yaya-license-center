@@ -1,2 +1,4 @@
-import { ProvidersPage } from "../shared/components/ReadPages";
-export default ProvidersPage;
+import ProvidersPage from "./components/ProvidersPage";
+export default function Page() {
+  return <ProvidersPage />;
+}

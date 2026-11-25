@@ -1,5 +1,22 @@
+mod application_protocol;
+mod application_market_reset;
+mod application_market;
+mod application_commerce;
+use application_market::*;
+mod licensing;
+mod skill_environment;
+mod employee_knowledge;
+mod website_auth;
+mod ops;
+mod staff_sessions;
+mod user_management;
+mod platform_versions;
+mod platform_delivery;
+mod local_docker;
+mod customer_deletion;
+use skill_environment::EnvironmentVariable;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{Cursor, Read, Write},
     net::SocketAddr,
@@ -7,7 +24,7 @@ use std::{
     sync::Arc,
 };
 
-use argon2::{Argon2, PasswordHash, PasswordVerifier};
+use argon2::Argon2;
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
@@ -25,6 +42,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, deco
 use password_hash::{PasswordHasher, SaltString};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use uuid::Uuid;
@@ -36,6 +54,7 @@ struct AppState {
     verification_key: Arc<DecodingKey>,
     database_path: PathBuf,
     sessions: Arc<RwLock<HashMap<String, AuthenticatedUser>>>,
+    ops: Arc<ops::OpsState>,
 }
 
 #[derive(Clone)]
@@ -103,6 +122,12 @@ struct AuditLogCustomer {
 #[serde(rename_all = "camelCase")]
 struct AuditLogQuery {
     limit: Option<u32>,
+    before: Option<i64>,
+    start: Option<i64>,
+    end: Option<i64>,
+    level: Option<String>,
+    customer_id: Option<String>,
+    search: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -128,6 +153,8 @@ struct AiEmployeeEntitlement {
     allowed_tools: Vec<String>,
     #[serde(default)]
     application_ids: Vec<String>,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    knowledge: Option<employee_knowledge::KnowledgeManifest>,
 }
 
 /// A signed, customer-visible plugin selection. Secrets are intentionally not
@@ -385,6 +412,7 @@ struct CreateSettlementBatchRequest {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OrderRecord {
+    payment_status:String,fulfillment_status:String,
     order_id: String,
     order_no: String,
     customer_id: String,
@@ -453,7 +481,6 @@ struct AiEmployeeProduct {
     price_cents: i64,
     billing_cycle: String,
     version: String,
-    package_version: String,
     skill_ids: Vec<String>,
     system_prompt: String,
     allow_network: bool,
@@ -522,6 +549,9 @@ struct ApplicationReleaseSubmission {
     applicant_subject: String,
     submitted_at: i64,
     snapshot: serde_json::Value,
+    #[serde(default)] product_id: Option<String>,
+    #[serde(default)] fingerprint: String,
+    #[serde(default)] review_reason: String,
 }
 
 fn default_application_version() -> String {
@@ -534,6 +564,26 @@ struct ReviewApplicationSubmissionRequest {
     approved: bool,
     #[serde(default)]
     reason: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GrantApplicationEntitlementRequest {
+    subject: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    expires_at: Option<i64>,
+}
+
+fn application_package_root() -> PathBuf {
+    std::env::var_os("YAYA_APPLICATION_PACKAGES_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("runtime/application-packages"))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[derive(Serialize)]
@@ -584,6 +634,8 @@ struct OperationSkill {
     status: String,
     created_at: i64,
     updated_at: i64,
+    environment_variables: Vec<EnvironmentVariable>,
+    environment_values: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -601,6 +653,24 @@ struct OperationSkillSnapshot {
     package_path: String,
     description: String,
     instructions: String,
+    #[serde(default)]
+    environment_values: BTreeMap<String, String>,
+}
+
+impl From<OperationSkill> for OperationSkillSnapshot {
+    fn from(skill: OperationSkill) -> Self {
+        Self {
+            id: skill.id,
+            title: skill.title,
+            package_name: skill.package_name,
+            source: skill.source,
+            version: skill.version,
+            package_path: skill.package_path,
+            description: skill.description,
+            instructions: skill.instructions,
+            environment_values: skill.environment_values,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -616,6 +686,8 @@ struct SaveOperationSkillRequest {
     description: String,
     #[serde(default)]
     instructions: String,
+    #[serde(default)]
+    environment_values: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -644,7 +716,7 @@ struct SessionStatus {
     user: Option<UserView>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct Envelope<T: Serialize> {
     code: i32,
     message: String,
@@ -653,6 +725,16 @@ struct Envelope<T: Serialize> {
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--file-agent") {
+        ops::files_agent::run().await.expect("run local file agent");
+        return;
+    }
+    if let Some(arg)=std::env::args().nth(1).filter(|s|s=="--market-reset-preview"||s=="--market-reset") {
+        let path=std::env::var_os("YAYA_OPERATION_CENTER_DB_PATH").or_else(||std::env::var_os("LICENSE_CENTER_DB_PATH")).map(PathBuf::from).unwrap_or_else(||PathBuf::from(".yaya-operation-center.sqlite3"));
+        let confirmation=if arg=="--market-reset"{Some(std::env::args().nth(2).expect("需要预览生成的确认凭据"))}else{None};
+        let result=application_market_reset::command(&path,confirmation.as_deref()).expect("market reset");
+        println!("{}",serde_json::to_string_pretty(&result).unwrap());return;
+    }
     let private_key = required_env("LICENSE_SIGNING_PRIVATE_KEY_PEM");
     let public_key = required_env("LICENSE_SIGNING_PUBLIC_KEY_PEM");
     let initial_admin_username = std::env::var("YAYA_OPERATION_CENTER_INITIAL_ADMIN_USERNAME")
@@ -678,6 +760,12 @@ async fn main() {
         initial_admin_password.as_deref(),
     )
     .expect("failed to initialize license database");
+    website_auth::initialize(&Connection::open(&database_path).expect("open website auth database"))
+        .expect("initialize website customer authentication");
+    ops::initialize(&database_path).expect("initialize staff sessions and operations database");
+    platform_versions::initialize(&database_path).expect("initialize platform package database");
+    platform_delivery::initialize(&database_path).expect("initialize platform delivery database");
+    platform_delivery::recover(&database_path).expect("recover interrupted local Docker deployments");
     let state = AppState {
         signing_key: Arc::new(
             EncodingKey::from_rsa_pem(private_key.as_bytes())
@@ -689,16 +777,32 @@ async fn main() {
         ),
         database_path,
         sessions: Arc::new(RwLock::new(HashMap::new())),
+        ops: Arc::new(ops::OpsState::from_env().expect("valid operations configuration")),
     };
+    platform_delivery::runtime_state::start(state.database_path.clone());
+    ops::telemetry::start(state.database_path.clone());
+    ops::terminal::recover(state.database_path.clone());
     let app = Router::new()
+        .merge(website_auth::router())
+        .merge(ops::router(state.clone()))
+        .merge(platform_versions::router())
+        .merge(platform_delivery::router())
         .route(
             "/healthz",
             get(|| async { Json(success("ok", LicenseStatus::simple(true))) }),
         )
         .route("/api/licenses", post(issue_license))
+        .merge(licensing::router())
         .route("/api/licenses", get(list_licenses))
         .route("/api/customers", get(list_customers).post(create_customer))
-        .route("/api/customers/{customer_id}", post(update_customer))
+        .route(
+            "/api/customers/{customer_id}",
+            post(update_customer).delete(customer_deletion::delete_customer),
+        )
+        .route(
+            "/api/customers/{customer_id}/deletion-eligibility",
+            get(customer_deletion::get_eligibility),
+        )
         .route(
             "/api/customers/{customer_id}/status",
             post(update_customer_status),
@@ -741,7 +845,52 @@ async fn main() {
             "/api/application-submissions/{submission_id}/review",
             post(review_application_submission),
         )
+        .route(
+            "/api/application-products/{product_id}/listing",
+            post(set_application_listing),
+        )
+        .route(
+            "/api/application-products/{product_id}/releases",
+            get(list_application_product_releases),
+        )
+        .route("/api/application-products", get(list_application_products))
+        .route("/api/application-products/{product_id}", delete(delete_application_product))
+        .route("/api/application-products/import", post(import_application_package))
+        .route(
+            "/api/application-products/{product_id}/entitlements",
+            get(list_application_entitlements).post(grant_application_entitlement),
+        )
+        .route(
+            "/api/application-products/{product_id}/entitlements/{subject}",
+            delete(revoke_application_entitlement),
+        )
+        .route("/api/market/application-submissions", get(publisher_application_submissions))
+        .route("/api/market/applications/{product_id}/publication", get(application_publication_info))
+        .route("/api/application-submissions/{submission_id}/status", get(application_submission_status))
+        .route("/api/market/applications/{product_id}/commercial", get(application_commerce::list_commercial).post(application_commerce::submit_commercial))
+        .route("/api/application-products/{product_id}/commercial", get(application_commerce::list_commercial).post(application_commerce::submit_commercial))
+        .route("/api/application-commercial/{id}/review", post(application_commerce::review_commercial))
+        .route("/api/application-commerce", get(application_commerce::overview))
+        .route("/api/application-commerce/{order_id}/refund", post(application_commerce::refund))
+        .route("/api/application-commerce/settlements", post(application_commerce::settle))
+        .route("/api/market/application-orders", get(application_commerce::my_orders))
+        .route("/api/market/application-orders/{order_id}/simulate-payment", post(application_commerce::simulate_payment))
+        .route("/api/market/application-orders/{order_id}/action", post(application_commerce::order_action))
+        .route("/api/market/application-revenues", get(application_commerce::publisher_revenues))
+        .route("/api/market/applications/{product_id}/checkout", post(application_commerce::checkout))
         .route("/api/market/applications", get(list_public_applications))
+        .route(
+            "/api/market/applications/{product_id}",
+            get(get_public_application),
+        )
+        .route(
+            "/api/market/applications/{product_id}/download-ticket",
+            post(create_application_download_ticket),
+        )
+        .route(
+            "/api/market/downloads/{ticket}",
+            get(download_application_package),
+        )
         .route(
             "/api/ai-employees/{employee_id}/status",
             post(update_ai_employee_product_status),
@@ -754,6 +903,9 @@ async fn main() {
             "/api/ai-employees/{employee_id}",
             delete(delete_ai_employee_product),
         )
+        .route("/api/ai-employees/{employee_id}/knowledge",get(employee_knowledge::list).post(employee_knowledge::upload).layer(DefaultBodyLimit::max(8*1024*1024)))
+        .route("/api/ai-employees/{employee_id}/knowledge/{document_id}",delete(employee_knowledge::remove))
+        .route("/api/market/ai-employees/{employee_id}/knowledge/{document_id}",get(employee_knowledge::download))
         .route(
             "/api/skills",
             get(list_operation_skills).post(save_operation_skill),
@@ -773,8 +925,10 @@ async fn main() {
             post(update_operation_skill_archive),
         )
         .route("/api/skills/{skill_id}", delete(delete_operation_skill))
-        .route("/api/session", get(session_status).post(create_session))
+        .route("/api/session", get(session_status).post(create_session).delete(close_session))
         .route("/api/users", get(list_users).post(create_user))
+        .route("/api/users/{user_id}", axum::routing::put(user_management::update).delete(user_management::remove))
+        .route("/api/users/{user_id}/status", post(user_management::set_status))
         .route("/api/providers", get(list_providers).post(create_provider))
         .route(
             "/api/commission-rules",
@@ -798,7 +952,7 @@ async fn main() {
         .route("/api/licenses/{license_id}/status", get(license_status))
         .route("/api/logs", get(list_audit_logs))
         .with_state(state.clone())
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024 + 1024 * 1024))
+        .layer(DefaultBodyLimit::max(66 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), audit_request))
         .layer(TraceLayer::new_for_http())
         .layer(
@@ -962,6 +1116,8 @@ fn endpoint_title(path: &str, method: &Method) -> &'static str {
         _ if path.starts_with("/api/orders/") && path.ends_with("/payment") => "登记订单回款",
         _ if path.starts_with("/api/orders/") && path.ends_with("/cancel") => "取消订单",
         _ if path.starts_with("/api/orders/") => "编辑订单",
+        _ if path.starts_with("/api/customers/") && path.ends_with("/deletion-eligibility") => "客户删除条件检查",
+        _ if path.starts_with("/api/customers/") && *method == Method::DELETE => "删除客户",
         _ if path.starts_with("/api/customers/") => "客户资料",
         _ if path.starts_with("/api/ai-employees/") => "AI 员工商品状态",
         _ if path.starts_with("/api/market/ai-employees/") && path.ends_with("/test-purchase") => {
@@ -1001,6 +1157,9 @@ fn redact_json_value(value: &mut serde_json::Value) {
                     "apikey",
                     "secret",
                     "token",
+                    "sessiontoken",
+                    "registrationtoken",
+                    "environmentvalues",
                 ]
                 .contains(&key.as_str())
                 {
@@ -1025,8 +1184,13 @@ async fn list_audit_logs(
     Query(query): Query<AuditLogQuery>,
 ) -> Result<Json<Envelope<Vec<AuditLogRecord>>>, (StatusCode, Json<Envelope<()>>)> {
     require_admin(&headers, &state).await?;
-    let limit = query.limit.unwrap_or(300).clamp(1, 1000);
-    let mut logs = list_audit_log_records(&state.database_path, limit)
+    if query.start.zip(query.end).is_some_and(|(start, end)| start >= end) {
+        return Err(error(StatusCode::BAD_REQUEST, "开始日期必须早于结束日期"));
+    }
+    if query.level.as_deref().is_some_and(|level| !["debug", "info", "warning", "error"].contains(&level)) {
+        return Err(error(StatusCode::BAD_REQUEST, "日志级别不合法"));
+    }
+    let mut logs = list_audit_log_records(&state.database_path, &query)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "日志读取失败"))?;
     for log in &mut logs {
         if log.endpoint_title == "运营接口" {
@@ -1045,16 +1209,23 @@ async fn issue_license(
     headers: HeaderMap,
     Json(request): Json<IssueLicenseRequest>,
 ) -> Result<Json<Envelope<IssueLicenseResponse>>, (StatusCode, Json<Envelope<()>>)> {
-    require_admin(&headers, &state).await?;
+    let actor = licensing::operator(&headers, &state).await?;
+    platform_versions::check_origin(&headers)?;
     let order_id = request.order_id.trim();
     if order_id.is_empty() {
         return Err(error(StatusCode::BAD_REQUEST, "orderId 不能为空"));
     }
-    let catalog_connection = Connection::open(&state.database_path)
+    let mut connection = ops::db::open(&state.database_path)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "订单读取失败"))?;
+    let catalog_connection = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| error(StatusCode::CONFLICT,"客户授权正在更新，请稍后重试"))?;
     let order = get_order(&catalog_connection, order_id)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "订单读取失败"))?
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "订单不存在"))?;
+    if let Some(id) = order.license_id.as_deref() {
+        let existing = get_license_record(&state.database_path,id).map_err(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"许可证读取失败"))?.ok_or_else(||error(StatusCode::CONFLICT,"订单授权记录不完整"))?;
+        return Ok(Json(success("该订单已经完成授权交付",IssueLicenseResponse{license:existing.license,license_id:existing.license_id,order_id:existing.order_id,expires_at:existing.expires_at,module_expires_at:existing.module_expires_at,module_titles:HashMap::new(),ai_employees:existing.ai_employees,platform_status:existing.platform_status,module_statuses:existing.module_statuses})));
+    }
     if order.status != "paid" {
         return Err(error(
             StatusCode::BAD_REQUEST,
@@ -1065,12 +1236,28 @@ async fn issue_license(
         return Err(error(StatusCode::CONFLICT, "该订单已经签发许可证"));
     }
 
+    licensing::validate_items(&order.items)?;
+    let active:bool=catalog_connection.query_row("SELECT EXISTS(SELECT 1 FROM customers WHERE customer_id=? AND status='active')",[&order.customer_id],|r|r.get(0)).map_err(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"客户读取失败"))?;
+    if !active {return Err(error(StatusCode::CONFLICT,"停用客户不可交付授权"));}
     let now = Utc::now().timestamp() as usize;
     let issued_at = Utc::now();
-    let mut modules = Vec::new();
-    let mut module_titles = HashMap::new();
-    let mut module_expires_at = HashMap::new();
-    let mut platform_expires_at = None;
+    let previous = licensing::latest(&catalog_connection,&order.customer_id).map_err(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"客户已有权益读取失败"))?;
+    let previous_claims = previous.as_ref().map(|record| {
+        let mut validation=Validation::new(Algorithm::RS256);
+        validation.validate_exp=false;
+        validation.set_issuer(&["yaya-operation-center","yaya-license-center"]);
+        validation.set_audience(&["yaya-low-code"]);
+        decode::<LicenseClaims>(&record.license,&state.verification_key,&validation).map(|v|v.claims)
+    }).transpose().map_err(|_|error(StatusCode::CONFLICT,"客户原授权签名无法验证，不能自动累计权益"))?;
+    if let Some(claims)=&previous_claims {
+        if claims.deployment_type != order.deployment_type {return Err(error(StatusCode::CONFLICT,"增购和续费须使用客户原授权的部署方式"));}
+    }
+    let mut modules = previous_claims.as_ref().map(|c|c.modules.clone()).unwrap_or_default();
+    let mut module_titles = previous_claims.as_ref().map(|c|c.module_titles.clone()).unwrap_or_default();
+    let mut module_expires_at = previous_claims.as_ref().map(|c|c.module_expires_at.clone()).unwrap_or_default();
+    // Older signatures omitted explicit module expirations; materialize their original cap.
+    if let Some(claims)=&previous_claims {for module in &claims.modules {if module!="platform" {module_expires_at.entry(module.clone()).or_insert(claims.exp as i64);}}}
+    let mut platform_expires_at = previous_claims.as_ref().map(|c|c.exp as i64);
     let mut ordered_ai_employees: HashMap<String, (String, i64)> = HashMap::new();
     for item in &order.items {
         if !["platform", "module", "ai_employee"].contains(&item.kind.as_str()) {
@@ -1085,13 +1272,11 @@ async fn issue_license(
                     format!("订单商品“{}”缺少有效的授权天数", item.title),
                 )
             })?;
-        let item_expires_at = (issued_at + chrono::Duration::days(days.into())).timestamp();
+        if days>36500 {return Err(error(StatusCode::BAD_REQUEST,"授权天数不得超过 36500 天"));}
+
         match item.kind.as_str() {
             "platform" => {
-                platform_expires_at = Some(
-                    platform_expires_at
-                        .map_or(item_expires_at, |current: i64| current.max(item_expires_at)),
-                );
+                platform_expires_at = Some(licensing::extend(platform_expires_at.unwrap_or(0),issued_at.timestamp(),days)?);
                 module_titles.insert("platform".to_string(), item.title.trim().to_string());
             }
             "module" => {
@@ -1101,10 +1286,8 @@ async fn issue_license(
                 }
                 modules.push(module.to_string());
                 module_titles.insert(module.to_string(), item.title.trim().to_string());
-                module_expires_at
-                    .entry(module.to_string())
-                    .and_modify(|current: &mut i64| *current = (*current).max(item_expires_at))
-                    .or_insert(item_expires_at);
+                let expiry=licensing::extend(module_expires_at.get(module).copied().unwrap_or(0),issued_at.timestamp(),days)?;
+                module_expires_at.insert(module.to_string(),expiry);
             }
             "ai_employee" => {
                 let employee_id = item.reference_id.as_deref().map(str::trim).unwrap_or("");
@@ -1114,27 +1297,24 @@ async fn issue_license(
                         "订单 AI 员工缺少 referenceId",
                     ));
                 }
-                ordered_ai_employees
-                    .entry(employee_id.to_string())
-                    .and_modify(|(_, expiry)| *expiry = (*expiry).max(item_expires_at))
-                    .or_insert((item.title.trim().to_string(), item_expires_at));
+                let prior=ordered_ai_employees.get(employee_id).map(|(_,e)|*e).or_else(||previous_claims.as_ref().and_then(|c|c.ai_employees.iter().find(|e|e.id==employee_id).map(|e|e.expires_at))).unwrap_or(0);
+                ordered_ai_employees.insert(employee_id.to_string(),(item.title.trim().to_string(),licensing::extend(prior,issued_at.timestamp(),days)?));
             }
             _ => {}
         }
     }
     let expires_at = platform_expires_at
-        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "订单必须包含低代码平台授权商品"))?;
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "首次授权需购买低代码平台；已有授权可单独增购或续费"))?;
+    if expires_at<=issued_at.timestamp(){return Err(error(StatusCode::BAD_REQUEST,"平台授权已过期，请在订单中续费平台后再交付增购权益"));}
     modules.push("platform".to_string());
     modules.sort();
     modules.dedup();
-    for expiry in module_expires_at.values_mut() {
-        *expiry = (*expiry).min(expires_at);
-    }
+
     let initial_module_statuses = modules
         .iter()
         .map(|module| (module.clone(), "unactivated".to_string()))
         .collect::<HashMap<_, _>>();
-    let mut ai_employees_by_id = HashMap::new();
+    let mut ai_employees_by_id: HashMap<String,AiEmployeeEntitlement> = previous_claims.as_ref().map(|c|c.ai_employees.iter().cloned().map(|e|(e.id.clone(),e)).collect()).unwrap_or_default();
     for (id, (title, entitlement_expires_at)) in ordered_ai_employees {
         let product = get_ai_employee_product(&catalog_connection, &id)
             .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "AI 员工模板读取失败"))?
@@ -1155,20 +1335,11 @@ async fn issue_license(
                         error(StatusCode::INTERNAL_SERVER_ERROR, "AI 员工 Skill 读取失败")
                     })?
                 {
-                    skill_snapshots.push(OperationSkillSnapshot {
-                        id: skill.id,
-                        title: skill.title,
-                        package_name: skill.package_name,
-                        source: skill.source,
-                        version: skill.version,
-                        package_path: skill.package_path,
-                        description: skill.description,
-                        instructions: skill.instructions,
-                    });
+                    skill_snapshots.push(OperationSkillSnapshot::from(skill));
                 }
             }
             (
-                product.package_version,
+                product.version,
                 skill_snapshots,
                 product.system_prompt.clone(),
             )
@@ -1178,12 +1349,13 @@ async fn issue_license(
             AiEmployeeEntitlement {
                 id,
                 title,
-                expires_at: entitlement_expires_at.min(expires_at),
+                expires_at: entitlement_expires_at,
                 template_version,
                 skills,
                 system_prompt,
                 allowed_tools: product.allowed_tools.clone(),
                 application_ids: product.application_ids.clone(),
+                knowledge: None,
             },
         );
     }
@@ -1202,7 +1374,7 @@ async fn issue_license(
         module_expires_at: module_expires_at.clone(),
         module_titles: module_titles.clone(),
         ai_employees: ai_employees.clone(),
-        plugin_packages: Vec::new(),
+        plugin_packages: previous_claims.as_ref().map(|c|c.plugin_packages.clone()).unwrap_or_default(),
         iss: "yaya-operation-center".to_string(),
         aud: "yaya-low-code".to_string(),
     };
@@ -1234,7 +1406,11 @@ async fn issue_license(
         platform_status: "unactivated".to_string(),
         module_statuses: initial_module_statuses,
     };
-    insert_issued_license(&state.database_path, &record).map_err(|_| {
+    insert_license_into_connection(&catalog_connection,&record).map_err(|_|error(StatusCode::CONFLICT,"该订单已经签发或授权保存失败"))?;
+    licensing::register(&catalog_connection,&record,&actor.user_id).map_err(|_|error(StatusCode::CONFLICT,"客户授权版本保存失败"))?;
+    let updated=catalog_connection.execute("UPDATE orders SET status='fulfilled',license_id=? WHERE order_id=? AND status='paid' AND license_id IS NULL",params![record.license_id,record.order_id]).map_err(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"订单履约保存失败"))?;
+    if updated!=1 {return Err(error(StatusCode::CONFLICT,"订单状态已变化"));}
+    catalog_connection.commit().map_err(|_| {
         error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "许可证和订单状态保存失败",
@@ -1301,19 +1477,28 @@ async fn create_customer(
     if name.is_empty() {
         return Err(error(StatusCode::BAD_REQUEST, "客户名称不能为空"));
     }
+    let phone = request.contact_phone.trim();
+    if phone.is_empty() {
+        return Err(error(StatusCode::BAD_REQUEST, "联系电话（手机号）不能为空"));
+    }
     let customer = CustomerRecord {
         customer_id: format!("cus_{}", Uuid::new_v4().simple()),
         name: name.to_string(),
         contact_name: request.contact_name.trim().to_string(),
-        contact_phone: request.contact_phone.trim().to_string(),
+        contact_phone: phone.to_string(),
         contact_email: request.contact_email.trim().to_string(),
         status: "active".to_string(),
         notes: request.notes.trim().to_string(),
         created_at: Utc::now().timestamp(),
     };
-    let connection = Connection::open(&state.database_path)
+    let mut connection = Connection::open(&state.database_path)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "客户保存失败"))?;
-    connection
+    // Serialize the duplicate check and insert without changing legacy customer data.
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "客户保存失败"))?;
+    validate_new_customer(&transaction, name, phone)?;
+    transaction
         .execute(
             "INSERT INTO customers (
                 customer_id, name, contact_name, contact_phone, contact_email,
@@ -1331,7 +1516,37 @@ async fn create_customer(
             ],
         )
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "客户保存失败"))?;
+    transaction.commit()
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "客户保存失败"))?;
     Ok(Json(success("客户已创建", customer)))
+}
+
+fn validate_new_customer(
+    connection: &Connection,
+    name: &str,
+    phone: &str,
+) -> Result<(), (StatusCode, Json<Envelope<()>>)> {
+    let name = name.trim();
+    let phone = phone.trim();
+    if name.is_empty() {
+        return Err(error(StatusCode::BAD_REQUEST, "客户名称不能为空"));
+    }
+    if phone.is_empty() {
+        return Err(error(StatusCode::BAD_REQUEST, "联系电话（手机号）不能为空"));
+    }
+    let (name_exists, phone_exists): (bool, bool) = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM customers WHERE TRIM(name) = ?),
+                EXISTS(SELECT 1 FROM customers WHERE TRIM(contact_phone) = ?)",
+        params![name, phone],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "客户重复校验失败"))?;
+    if name_exists {
+        return Err(error(StatusCode::CONFLICT, "客户名称已存在，请勿重复创建"));
+    }
+    if phone_exists {
+        return Err(error(StatusCode::CONFLICT, "联系电话（手机号）已存在，请勿重复创建"));
+    }
+    Ok(())
 }
 
 async fn update_customer(
@@ -1553,6 +1768,7 @@ async fn create_order(
     if !["saas", "local"].contains(&request.deployment_type.as_str()) {
         return Err(error(StatusCode::BAD_REQUEST, "平台类型无效"));
     }
+    licensing::validate_items(&request.items)?;
     if request.items.is_empty() {
         return Err(error(StatusCode::BAD_REQUEST, "订单至少需要一个商品项"));
     }
@@ -1740,6 +1956,12 @@ async fn update_order(
     Json(request): Json<CreateOrderRequest>,
 ) -> Result<Json<Envelope<OrderRecord>>, (StatusCode, Json<Envelope<()>>)> {
     require_admin(&headers, &state).await?;
+    if Connection::open(&state.database_path).map_err(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"订单读取失败"))?
+        .query_row("SELECT EXISTS(SELECT 1 FROM application_order_details WHERE order_id=?)",[&order_id],|r|r.get::<_,bool>(0)).map_err(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"订单读取失败"))? {
+        return Err(error(StatusCode::BAD_REQUEST,"应用订单请使用应用交易管理操作，不能通过通用订单接口修改"));
+    }
+
+    licensing::validate_items(&request.items)?;
     if !["saas", "local"].contains(&request.deployment_type.as_str()) || request.items.is_empty() {
         return Err(error(
             StatusCode::BAD_REQUEST,
@@ -1794,6 +2016,11 @@ async fn record_payment(
     Json(request): Json<RecordPaymentRequest>,
 ) -> Result<Json<Envelope<OrderRecord>>, (StatusCode, Json<Envelope<()>>)> {
     require_admin(&headers, &state).await?;
+    if Connection::open(&state.database_path).map_err(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"订单读取失败"))?
+        .query_row("SELECT EXISTS(SELECT 1 FROM application_order_details WHERE order_id=?)",[&order_id],|r|r.get::<_,bool>(0)).map_err(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"订单读取失败"))? {
+        return Err(error(StatusCode::BAD_REQUEST,"应用订单请使用应用交易管理操作，不能通过通用订单接口修改"));
+    }
+
     if request.amount_cents <= 0 || request.method.trim().is_empty() {
         return Err(error(StatusCode::BAD_REQUEST, "回款金额和收款方式不能为空"));
     }
@@ -1884,6 +2111,11 @@ async fn cancel_order(
     Path(order_id): Path<String>,
 ) -> Result<Json<Envelope<OrderRecord>>, (StatusCode, Json<Envelope<()>>)> {
     require_admin(&headers, &state).await?;
+    if Connection::open(&state.database_path).map_err(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"订单读取失败"))?
+        .query_row("SELECT EXISTS(SELECT 1 FROM application_order_details WHERE order_id=?)",[&order_id],|r|r.get::<_,bool>(0)).map_err(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"订单读取失败"))? {
+        return Err(error(StatusCode::BAD_REQUEST,"应用订单请使用应用交易管理操作，不能通过通用订单接口修改"));
+    }
+
     let connection = Connection::open(&state.database_path)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "订单取消失败"))?;
     let updated = connection
@@ -2025,123 +2257,13 @@ async fn list_public_ai_employee_products(
             category: product.category,
             price_cents: product.price_cents,
             billing_cycle: product.billing_cycle,
-            version: product.package_version,
+            version: product.version,
             avatar_url: product
                 .avatar_url
                 .map(|_| format!("/api/ai-employees/{}/avatar", product.id)),
         })
         .collect();
     Ok(Json(success("AI 员工市场已读取", products)))
-}
-
-async fn receive_application_submission(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(mut submission): Json<ApplicationReleaseSubmission>,
-) -> Result<Json<Envelope<ApplicationReleaseSubmission>>, (StatusCode, Json<Envelope<()>>)> {
-    let token =
-        bearer_token(&headers).ok_or_else(|| error(StatusCode::UNAUTHORIZED, "缺少平台许可证"))?;
-    let claims = verify_license(token, &state)
-        .map_err(|_| error(StatusCode::UNAUTHORIZED, "平台许可证无效或已过期"))?;
-    submission.applicant_subject = claims.subject;
-    if submission.submission_id.trim().is_empty() || submission.app_id.trim().is_empty() {
-        return Err(error(StatusCode::BAD_REQUEST, "应用上线申请信息不完整"));
-    }
-    let connection = Connection::open(&state.database_path)
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "应用上线申请保存失败"))?;
-    let snapshot = serde_json::to_string(&submission.snapshot)
-        .map_err(|_| error(StatusCode::BAD_REQUEST, "应用结构快照无效"))?;
-    connection.execute(
-        "INSERT INTO application_releases (submission_id,app_id,app_name,version,status,submitted_by,applicant_subject,submitted_at,snapshot_json) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(submission_id) DO UPDATE SET app_name=excluded.app_name, version=excluded.version, snapshot_json=excluded.snapshot_json, submitted_at=excluded.submitted_at, applicant_subject=excluded.applicant_subject",
-        params![submission.submission_id, submission.app_id, submission.app_name, submission.version, "pending_review", submission.submitted_by, submission.applicant_subject, submission.submitted_at, snapshot],
-    ).map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "应用上线申请保存失败"))?;
-    Ok(Json(success("应用上线申请已接收", submission)))
-}
-
-async fn list_application_submissions(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Envelope<Vec<ApplicationReleaseSubmission>>>, (StatusCode, Json<Envelope<()>>)> {
-    require_admin(&headers, &state).await?;
-    let connection = Connection::open(&state.database_path)
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "应用上线申请读取失败"))?;
-    let mut statement = connection.prepare("SELECT submission_id,app_id,app_name,version,status,submitted_by,applicant_subject,submitted_at,snapshot_json FROM application_releases ORDER BY submitted_at DESC")
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "应用上线申请读取失败"))?;
-    let rows = statement
-        .query_map([], |row| {
-            let snapshot_json: String = row.get(8)?;
-            Ok(ApplicationReleaseSubmission {
-                submission_id: row.get(0)?,
-                app_id: row.get(1)?,
-                app_name: row.get(2)?,
-                version: row.get(3)?,
-                status: row.get(4)?,
-                submitted_by: row.get(5)?,
-                applicant_subject: row.get(6)?,
-                submitted_at: row.get(7)?,
-                snapshot: serde_json::from_str(&snapshot_json)
-                    .unwrap_or_else(|_| serde_json::json!({})),
-            })
-        })
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "应用上线申请读取失败"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "应用上线申请读取失败"))?;
-    Ok(Json(success("应用上线申请已读取", rows)))
-}
-
-async fn review_application_submission(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(submission_id): Path<String>,
-    Json(request): Json<ReviewApplicationSubmissionRequest>,
-) -> Result<Json<Envelope<ApplicationReleaseSubmission>>, (StatusCode, Json<Envelope<()>>)> {
-    require_admin(&headers, &state).await?;
-    let connection = Connection::open(&state.database_path)
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "应用上线审核失败"))?;
-    let status = if request.approved {
-        "approved"
-    } else {
-        "rejected"
-    };
-    let updated = connection.execute("UPDATE application_releases SET status=?, reviewed_at=?, review_reason=? WHERE submission_id=?", params![status, Utc::now().timestamp(), request.reason.trim(), submission_id]).map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "应用上线审核失败"))?;
-    if updated == 0 {
-        return Err(error(StatusCode::NOT_FOUND, "应用上线申请不存在"));
-    }
-    let row = connection.query_row("SELECT submission_id,app_id,app_name,version,status,submitted_by,applicant_subject,submitted_at,snapshot_json FROM application_releases WHERE submission_id=?", [submission_id.as_str()], |row| { let snapshot_json: String = row.get(8)?; Ok(ApplicationReleaseSubmission { submission_id: row.get(0)?, app_id: row.get(1)?, app_name: row.get(2)?, version: row.get(3)?, status: row.get(4)?, submitted_by: row.get(5)?, applicant_subject: row.get(6)?, submitted_at: row.get(7)?, snapshot: serde_json::from_str(&snapshot_json).unwrap_or_else(|_| serde_json::json!({})) }) }).map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "应用上线审核失败"))?;
-    Ok(Json(success("应用上线审核已完成", row)))
-}
-
-async fn list_public_applications(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Envelope<Vec<ApplicationReleaseSubmission>>>, (StatusCode, Json<Envelope<()>>)> {
-    let token =
-        bearer_token(&headers).ok_or_else(|| error(StatusCode::UNAUTHORIZED, "缺少平台许可证"))?;
-    verify_license(token, &state)
-        .map_err(|_| error(StatusCode::UNAUTHORIZED, "平台许可证无效或已过期"))?;
-    let connection = Connection::open(&state.database_path)
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "应用市场读取失败"))?;
-    let mut statement = connection.prepare("SELECT submission_id,app_id,app_name,version,status,submitted_by,applicant_subject,submitted_at,snapshot_json FROM application_releases WHERE status='approved' ORDER BY submitted_at DESC").map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "应用市场读取失败"))?;
-    let rows = statement
-        .query_map([], |row| {
-            let snapshot_json: String = row.get(8)?;
-            Ok(ApplicationReleaseSubmission {
-                submission_id: row.get(0)?,
-                app_id: row.get(1)?,
-                app_name: row.get(2)?,
-                version: row.get(3)?,
-                status: row.get(4)?,
-                submitted_by: row.get(5)?,
-                applicant_subject: row.get(6)?,
-                submitted_at: row.get(7)?,
-                snapshot: serde_json::from_str(&snapshot_json)
-                    .unwrap_or_else(|_| serde_json::json!({})),
-            })
-        })
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "应用市场读取失败"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "应用市场读取失败"))?;
-    Ok(Json(success("应用市场已读取", rows)))
 }
 
 async fn get_owned_ai_employee_package(
@@ -2172,18 +2294,10 @@ async fn get_owned_ai_employee_package(
         if let Some(skill) = get_operation_skill(&connection, &skill_id)
             .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "AI 员工 Skill 读取失败"))?
         {
-            skills.push(OperationSkillSnapshot {
-                id: skill.id,
-                title: skill.title,
-                package_name: skill.package_name,
-                source: skill.source,
-                version: skill.version,
-                package_path: skill.package_path,
-                description: skill.description,
-                instructions: skill.instructions,
-            });
+            skills.push(OperationSkillSnapshot::from(skill));
         }
     }
+    let knowledge=Some(employee_knowledge::manifest(&connection, &product.id, &product.version).map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR,"员工知识读取失败"))?);
     let system_prompt = product.system_prompt.clone();
     Ok(Json(success(
         "AI 员工安装包已读取",
@@ -2191,10 +2305,11 @@ async fn get_owned_ai_employee_package(
             id: product.id,
             title: product.title,
             expires_at: entitlement.expires_at,
-            template_version: product.package_version,
+            template_version: product.version,
             skills,
             system_prompt,
             allowed_tools: product.allowed_tools,
+            knowledge,
             application_ids: product.application_ids,
         },
     )))
@@ -2275,21 +2390,7 @@ async fn test_purchase_ai_employee(
     }
 
     let now = Utc::now().timestamp();
-    let latest_record = list_license_records(&state.database_path)
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "许可证状态读取失败"))?
-        .into_iter()
-        .filter(|record| {
-            record.subject == current_claims.subject
-                && record.linkage_status != "legacy_unlinked"
-                && record.platform_status != "destroyed"
-                && record.expires_at > now
-        })
-        .max_by(|left, right| {
-            left.issued_at
-                .cmp(&right.issued_at)
-                .then_with(|| left.license_id.cmp(&right.license_id))
-        })
-        .unwrap_or(current_record);
+    let latest_record = licensing::latest(&connection,&current_claims.subject).map_err(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"客户授权读取失败"))?.unwrap_or(current_record);
     let latest_claims = verify_license(&latest_record.license, &state)
         .map_err(|_| error(StatusCode::CONFLICT, "客户最新许可证无效，无法生成累计权益"))?;
     let purchase_days = match product.billing_cycle.as_str() {
@@ -2298,26 +2399,10 @@ async fn test_purchase_ai_employee(
         "one_time" => 3650,
         _ => return Err(error(StatusCode::BAD_REQUEST, "AI 员工计费周期无效")),
     };
-    let mut items = cumulative_entitlement_items(&latest_claims, now, &product, purchase_days);
-    items.push(OrderLineItem {
-        kind: "ai_employee".to_string(),
-        reference_id: Some(product.id.clone()),
-        title: product.title.clone(),
-        quantity: 1,
-        unit_price_cents: product.price_cents,
-        entitlement_days: Some(
-            remaining_days(
-                latest_claims
-                    .ai_employees
-                    .iter()
-                    .find(|item| item.id == product.id)
-                    .map(|item| item.expires_at)
-                    .unwrap_or(now),
-                now,
-            )
-            .saturating_add(purchase_days),
-        ),
-    });
+    let items = vec![OrderLineItem {
+        kind:"ai_employee".into(),reference_id:Some(product.id.clone()),title:product.title.clone(),quantity:1,
+        unit_price_cents:product.price_cents,entitlement_days:Some(purchase_days),
+    }];
 
     let order_id = format!("ord_{}", Uuid::new_v4().simple());
     let order_no = format!(
@@ -2388,6 +2473,7 @@ async fn test_purchase_ai_employee(
         HeaderValue::from_str(&format!("license_center_session={internal_session_id}"))
             .expect("session cookie is valid"),
     );
+    if let Some(origin)=headers.get("origin") {admin_headers.insert("origin",origin.clone());}
     let Json(issued) = issue_license(
         State(state.clone()),
         admin_headers,
@@ -2409,72 +2495,6 @@ async fn test_purchase_ai_employee(
             status: "fulfilled".to_string(),
         },
     )))
-}
-
-fn cumulative_entitlement_items(
-    claims: &LicenseClaims,
-    now: i64,
-    purchased_product: &AiEmployeeProduct,
-    _purchase_days: u32,
-) -> Vec<OrderLineItem> {
-    let mut items = Vec::new();
-    items.push(OrderLineItem {
-        kind: "platform".to_string(),
-        reference_id: Some("platform".to_string()),
-        title: claims
-            .module_titles
-            .get("platform")
-            .cloned()
-            .unwrap_or_else(|| "低代码平台".to_string()),
-        quantity: 1,
-        unit_price_cents: 0,
-        entitlement_days: Some(remaining_days(claims.exp as i64, now)),
-    });
-    for module in claims
-        .modules
-        .iter()
-        .filter(|module| module.as_str() != "platform")
-    {
-        items.push(OrderLineItem {
-            kind: "module".to_string(),
-            reference_id: Some(module.clone()),
-            title: claims
-                .module_titles
-                .get(module)
-                .cloned()
-                .unwrap_or_else(|| module_title(module)),
-            quantity: 1,
-            unit_price_cents: 0,
-            entitlement_days: Some(remaining_days(
-                claims
-                    .module_expires_at
-                    .get(module)
-                    .copied()
-                    .unwrap_or(claims.exp as i64),
-                now,
-            )),
-        });
-    }
-    for employee in claims
-        .ai_employees
-        .iter()
-        .filter(|employee| employee.id != purchased_product.id && employee.expires_at > now)
-    {
-        items.push(OrderLineItem {
-            kind: "ai_employee".to_string(),
-            reference_id: Some(employee.id.clone()),
-            title: employee.title.clone(),
-            quantity: 1,
-            unit_price_cents: 0,
-            entitlement_days: Some(remaining_days(employee.expires_at, now)),
-        });
-    }
-    items
-}
-
-fn remaining_days(expires_at: i64, now: i64) -> u32 {
-    let seconds = expires_at.saturating_sub(now).max(1);
-    ((seconds.saturating_add(86_399) / 86_400) as u64).min(u32::MAX as u64) as u32
 }
 
 async fn create_ai_employee_product(
@@ -2551,8 +2571,6 @@ async fn create_ai_employee_product(
             ],
         )
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "AI 员工保存失败"))?;
-    refresh_ai_employee_package_version(&connection, &id, now)
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "AI 员工包版本更新失败"))?;
     let product = get_ai_employee_product(&connection, &id)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "AI 员工读取失败"))?
         .ok_or_else(|| error(StatusCode::INTERNAL_SERVER_ERROR, "AI 员工保存失败"))?;
@@ -2658,8 +2676,6 @@ async fn update_ai_employee_product_status(
     if updated == 0 {
         return Err(error(StatusCode::NOT_FOUND, "AI 员工不存在"));
     }
-    refresh_ai_employee_package_version(&connection, &employee_id, now)
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "AI 员工包版本更新失败"))?;
     let product = get_ai_employee_product(&connection, &employee_id)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "AI 员工读取失败"))?
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "AI 员工不存在"))?;
@@ -2948,14 +2964,23 @@ async fn save_operation_skill(
     let existing_skill = get_operation_skill(&connection, &id)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Skill 读取失败"))?
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "Skill 不存在"))?;
+    let definitions =
+        skill_environment::discover(&existing_skill.package_path, &request.instructions);
+    let environment_values = request
+        .environment_values
+        .unwrap_or_else(|| existing_skill.environment_values.clone());
+    skill_environment::validate_values(&definitions, &environment_values)
+        .map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
+    let environment_json = serde_json::to_string(&environment_values)
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "环境变量保存失败"))?;
     let version = next_patch_version(&existing_skill.version);
     connection
         .execute(
             "INSERT INTO operation_skills (
             id, title, package_name, source, version, package_path,
             description, instructions, allowed_tools_json, application_ids_json,
-            status, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+            status, created_at, updated_at, environment_values_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
             title = excluded.title,
             package_name = excluded.package_name,
@@ -2966,6 +2991,7 @@ async fn save_operation_skill(
             instructions = excluded.instructions,
             allowed_tools_json = excluded.allowed_tools_json,
             application_ids_json = excluded.application_ids_json,
+            environment_values_json = excluded.environment_values_json,
             updated_at = excluded.updated_at",
             params![
                 &id,
@@ -2984,10 +3010,11 @@ async fn save_operation_skill(
                 "[]",
                 now,
                 now,
+                environment_json,
             ],
         )
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Skill 保存失败"))?;
-    refresh_ai_employee_package_versions_for_skill(&connection, &id, now)
+    bump_employee_versions_for_skill(&connection, &id, now)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "AI 员工版本更新失败"))?;
     let skill = get_operation_skill(&connection, &id)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Skill 读取失败"))?
@@ -3032,7 +3059,7 @@ async fn update_operation_skill_archive(
             params![version, package_path, instructions, now, skill_id.trim()],
         )
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Skill 更新失败"))?;
-    refresh_ai_employee_package_versions_for_skill(&connection, skill_id.trim(), now)
+    bump_employee_versions_for_skill(&connection, skill_id.trim(), now)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "AI 员工版本更新失败"))?;
     let skill = get_operation_skill(&connection, skill_id.trim())
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Skill 读取失败"))?
@@ -3069,7 +3096,7 @@ async fn update_operation_skill_status(
     if updated == 0 {
         return Err(error(StatusCode::NOT_FOUND, "Skill 不存在"));
     }
-    refresh_ai_employee_package_versions_for_skill(&connection, &skill_id, Utc::now().timestamp())
+    bump_employee_versions_for_skill(&connection, &skill_id, Utc::now().timestamp())
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "AI 员工版本更新失败"))?;
     let skill = get_operation_skill(&connection, &skill_id)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Skill 读取失败"))?
@@ -3082,7 +3109,8 @@ async fn revoke_license(
     headers: HeaderMap,
     Path(license_id): Path<String>,
 ) -> Result<Json<Envelope<LicenseStatus>>, (StatusCode, Json<Envelope<()>>)> {
-    require_admin(&headers, &state).await?;
+    require_platform_admin(&headers, &state).await?;
+    platform_versions::check_origin(&headers)?;
     destroy_license_by_id(&state, &license_id).await?;
     Ok(Json(success("许可证已吊销", LicenseStatus::simple(false))))
 }
@@ -3092,7 +3120,8 @@ async fn destroy_license(
     headers: HeaderMap,
     Path(license_id): Path<String>,
 ) -> Result<Json<Envelope<LicenseStatus>>, (StatusCode, Json<Envelope<()>>)> {
-    require_admin(&headers, &state).await?;
+    require_platform_admin(&headers, &state).await?;
+    platform_versions::check_origin(&headers)?;
     destroy_license_by_id(&state, &license_id).await?;
     Ok(Json(success("许可证已销毁", LicenseStatus::simple(false))))
 }
@@ -3155,26 +3184,7 @@ async fn license_status(
             .ok()
             .flatten()
             .is_some_and(|license| license.platform_status != "destroyed");
-    let latest = if valid {
-        claims.as_ref().and_then(|claims| {
-            list_license_records(&state.database_path)
-                .ok()?
-                .into_iter()
-                .filter(|license| {
-                    license.subject == claims.subject
-                        && license.linkage_status != "legacy_unlinked"
-                        && license.platform_status != "destroyed"
-                        && license.expires_at > Utc::now().timestamp()
-                })
-                .max_by(|left, right| {
-                    left.issued_at
-                        .cmp(&right.issued_at)
-                        .then_with(|| left.license_id.cmp(&right.license_id))
-                })
-        })
-    } else {
-        None
-    };
+    let latest = if valid {claims.as_ref().and_then(|claims|ops::db::open(&state.database_path).ok().and_then(|db|licensing::latest(&db,&claims.subject).ok().flatten()).filter(|l|l.expires_at>Utc::now().timestamp()))} else {None};
     let mut status = LicenseStatus::simple(valid);
     if let Some(latest) = latest.filter(|license| license.license_id != license_id) {
         status.latest_license = Some(latest.license);
@@ -3203,8 +3213,18 @@ async fn destroy_license_by_id(
             .module_statuses
             .insert(module.clone(), "destroyed".to_string());
     }
-    update_license_record(&state.database_path, &license)
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "许可证状态保存失败"))?;
+    let mut db=ops::db::open(&state.database_path).map_err(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"授权撤销失败"))?;
+    let tx=db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|_|error(StatusCode::CONFLICT,"授权正在更新"))?;
+    let auth:Option<String>=tx.query_row("SELECT authorization_id FROM customer_authorizations WHERE customer_id=? AND (latest_license_id=? OR active_license_id=?)",params![license.subject,license_id,license_id],|r|r.get(0)).optional().map_err(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"授权读取失败"))?;
+    if let Some(auth)=auth {
+        tx.execute("UPDATE licenses SET platform_status='destroyed' WHERE license_id IN (SELECT license_id FROM authorization_versions WHERE authorization_id=?)",[&auth]).map_err(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"授权撤销失败"))?;
+        tx.execute("UPDATE authorization_versions SET state='revoked' WHERE authorization_id=?",[&auth]).map_err(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"授权撤销失败"))?;
+        tx.execute("UPDATE customer_authorizations SET active_license_id=NULL WHERE authorization_id=?",[auth]).map_err(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"授权撤销失败"))?;
+    } else {
+        tx.execute("UPDATE licenses SET platform_status='destroyed' WHERE license_id=?",[license_id]).map_err(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"许可证撤销失败"))?;
+        tx.execute("UPDATE authorization_versions SET state='revoked' WHERE license_id=?",[license_id]).map_err(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"许可证撤销失败"))?;
+    }
+    tx.commit().map_err(|_|error(StatusCode::INTERNAL_SERVER_ERROR,"授权撤销失败"))?;
     Ok(())
 }
 
@@ -3264,11 +3284,10 @@ fn license_view(license: &LicenseRecord) -> LicenseView {
         issued_at: license.issued_at,
         expires_at: license.expires_at,
         module_expires_at: license.module_expires_at.clone(),
-        module_titles: license
-            .modules
-            .iter()
-            .map(|module| (module.clone(), module_title(module)))
-            .collect(),
+        module_titles: {
+            let payload=license.license.split('.').nth(1).and_then(|v|base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD,v).ok()).and_then(|v|serde_json::from_slice::<serde_json::Value>(&v).ok());
+            license.modules.iter().map(|module|(module.clone(),payload.as_ref().and_then(|v|v["moduleTitles"][module].as_str()).map(str::to_owned).unwrap_or_else(||module_title(module)))).collect()
+        },
         ai_employees: license.ai_employees.clone(),
         ai_employee_statuses,
         platform_status,
@@ -3281,7 +3300,7 @@ fn module_expiry(license: &LicenseRecord, module: &str) -> i64 {
         .module_expires_at
         .get(module)
         .copied()
-        .unwrap_or(license.expires_at)
+        .unwrap_or(license.expires_at).min(license.expires_at)
 }
 
 fn module_title(module: &str) -> String {
@@ -3304,9 +3323,11 @@ fn verify_license(token: &str, state: &AppState) -> Result<LicenseClaims, ()> {
     let mut validation = Validation::new(Algorithm::RS256);
     validation.set_issuer(&["yaya-operation-center", "yaya-license-center"]);
     validation.set_audience(&["yaya-low-code"]);
-    decode::<LicenseClaims>(token, &state.verification_key, &validation)
-        .map(|data| data.claims)
-        .map_err(|_| ())
+    let claims=decode::<LicenseClaims>(token,&state.verification_key,&validation).map_err(|_|())?.claims;
+    let db=ops::db::open(&state.database_path).map_err(|_|())?;
+    let version:Option<String>=db.query_row("SELECT state FROM authorization_versions WHERE license_id=?",[&claims.license_id],|r|r.get(0)).optional().map_err(|_|())?;
+    if version.as_deref().is_some_and(|s|["superseded","revoked"].contains(&s)) {return Err(());}
+    Ok(claims)
 }
 
 async fn session_status(
@@ -3327,65 +3348,55 @@ async fn create_session(
     State(state): State<AppState>,
     Json(request): Json<LoginRequest>,
 ) -> Result<(HeaderMap, Json<Envelope<SessionStatus>>), (StatusCode, Json<Envelope<()>>)> {
-    let username = request.username.trim();
-    let connection = Connection::open(&state.database_path)
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "账号读取失败"))?;
-    let user = connection.query_row(
-        "SELECT user_id, password_hash, role, organization_id, status FROM users WHERE username = ?",
-        [username],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?)),
-    ).optional().map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "账号读取失败"))?
-        .filter(|(_, _, _, _, status)| status == "active")
-        .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "账号或密码错误"))?;
-    let parsed_hash = PasswordHash::new(&user.1)
-        .map_err(|_| error(StatusCode::UNAUTHORIZED, "账号或密码错误"))?;
-    Argon2::default()
-        .verify_password(request.password.as_bytes(), &parsed_hash)
-        .map_err(|_| error(StatusCode::UNAUTHORIZED, "账号或密码错误"))?;
-    let session_id = Uuid::new_v4().simple().to_string();
-    state.sessions.write().await.insert(
-        session_id.clone(),
-        AuthenticatedUser {
-            user_id: user.0.clone(),
-            role: user.2,
-            organization_id: user.3,
-        },
-    );
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        SET_COOKIE,
-        HeaderValue::from_str(&format!(
-            "license_center_session={session_id}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800"
-        ))
-        .expect("session id is valid for a cookie"),
-    );
-    Ok((
-        headers,
-        Json(success(
-            "登录成功",
-            SessionStatus {
-                authenticated: true,
-                user: Some(user_view(&state.database_path, &user.0)?),
-            },
-        )),
-    ))
+    let (session_id,user_id)=ops::db::blocking(state.database_path.clone(),move |connection| {
+        staff_sessions::login(connection,request,Utc::now().timestamp_millis())
+    }).await.map_err(|message| error(if message == "账号或密码错误" {StatusCode::UNAUTHORIZED}else{StatusCode::SERVICE_UNAVAILABLE},message))?;
+    let mut headers=HeaderMap::new();
+    headers.insert(SET_COOKIE,HeaderValue::from_str(&format!(
+        "license_center_session={session_id}; HttpOnly; Path=/; SameSite=Lax; Max-Age=604800{}",staff_cookie_secure_suffix()
+    )).expect("generated session cookie is valid"));
+    Ok((headers,Json(success("登录成功",SessionStatus{authenticated:true,user:Some(user_view(&state.database_path,&user_id)?)}))))
+}
+
+fn staff_cookie_secure_suffix() -> &'static str {
+    let secure=std::env::var("YAYA_SESSION_SECURE_COOKIE").map(|v|v=="true" || v=="1").unwrap_or_else(|_| {
+        std::env::var("YAYA_OPERATION_CENTER_WEB_ORIGIN").is_ok_and(|v|v.starts_with("https://"))
+    });
+    if secure {"; Secure"} else {""}
+}
+
+async fn close_session(
+    State(state):State<AppState>,headers:HeaderMap,
+) -> Result<(HeaderMap,Json<Envelope<()>>),(StatusCode,Json<Envelope<()>>)> {
+    if let Some(origin)=headers.get("origin") {
+        let origin=origin.to_str().unwrap_or("");
+        let configured=std::env::var("YAYA_OPERATION_CENTER_WEB_ORIGIN").unwrap_or_default();
+        if !["http://localhost:8778","http://127.0.0.1:8778"].contains(&origin) && (configured.is_empty() || origin!=configured.trim_end_matches('/')) {
+            return Err(error(StatusCode::FORBIDDEN,"请求来源不被允许"));
+        }
+    }
+    if let Some(token)=cookie_value(&headers,"license_center_session").map(str::to_owned) {
+        ops::db::blocking(state.database_path.clone(),move |connection|staff_sessions::revoke(connection,&token,Utc::now().timestamp_millis())).await
+            .map_err(|message|error(StatusCode::SERVICE_UNAVAILABLE,message))?;
+    }
+    let mut response=HeaderMap::new();
+    response.insert(SET_COOKIE,HeaderValue::from_str(&format!("license_center_session=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0{}",staff_cookie_secure_suffix())).unwrap());
+    Ok((response,Json(success("已退出",()))))
 }
 
 async fn require_authenticated(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<AuthenticatedUser, (StatusCode, Json<Envelope<()>>)> {
-    let sessions = state.sessions.read().await;
-    if cookie_value(headers, "license_center_session")
-        .and_then(|id| sessions.get(id).cloned())
-        .is_some()
-    {
-        Ok(cookie_value(headers, "license_center_session")
-            .and_then(|id| sessions.get(id).cloned())
-            .expect("session checked"))
-    } else {
-        Err(error(StatusCode::UNAUTHORIZED, "请先登录"))
+    let token=cookie_value(headers,"license_center_session").ok_or_else(||error(StatusCode::UNAUTHORIZED,"请先登录"))?.to_owned();
+    // Only the existing, server-generated test-purchase adapter uses the ephemeral map.
+    // Browser logins are never added to it, and cannot bypass persistent account checks.
+    if let Some(user)=state.sessions.read().await.get(&token).filter(|u|u.user_id=="system-test-purchase").cloned() {
+        return Ok(user);
     }
+    ops::db::blocking(state.database_path.clone(),move |connection|staff_sessions::authenticate(connection,&token,Utc::now().timestamp_millis())).await
+        .map_err(|message|error(StatusCode::SERVICE_UNAVAILABLE,message))?
+        .ok_or_else(||error(StatusCode::UNAUTHORIZED,"登录已过期或账号权限已变更，请重新登录"))
 }
 
 async fn require_admin(
@@ -3453,6 +3464,7 @@ async fn create_user(
     Json(request): Json<CreateUserRequest>,
 ) -> Result<Json<Envelope<UserView>>, (StatusCode, Json<Envelope<()>>)> {
     require_platform_admin(&headers, &state).await?;
+    platform_versions::check_origin(&headers)?;
     let username = request.username.trim();
     if username.len() < 3
         || username.len() > 64
@@ -3471,6 +3483,10 @@ async fn create_user(
     if !FIXED_ROLES.contains(&request.role.as_str()) {
         return Err(error(StatusCode::BAD_REQUEST, "角色不在固定角色范围内"));
     }
+    let organization_id = request.organization_id.as_deref().unwrap_or("platform").trim();
+    if organization_id.is_empty() {
+        return Err(error(StatusCode::BAD_REQUEST, "所属组织不能为空"));
+    }
     let salt = SaltString::encode_b64(Uuid::new_v4().as_bytes())
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "密码处理失败"))?;
     let password_hash = Argon2::default()
@@ -3482,9 +3498,7 @@ async fn create_user(
         username: username.to_string(),
         display_name: request.display_name.trim().to_string(),
         role: request.role,
-        organization_id: request
-            .organization_id
-            .unwrap_or_else(|| "platform".to_string()),
+        organization_id: organization_id.to_string(),
         status: "active".to_string(),
     };
     let connection = Connection::open(&state.database_path)
@@ -3542,7 +3556,10 @@ fn get_customer(
 
 fn order_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OrderRecord> {
     let items_json: String = row.get(4)?;
+    let status:String=row.get(7)?;let received:i64=row.get(6)?;let total:i64=row.get(5)?;
     Ok(OrderRecord {
+        payment_status:if status=="cancelled"{"cancelled"}else if received>=total||["paid","fulfilled"].contains(&status.as_str()){"paid"}else if received>0{"partial"}else{"unpaid"}.into(),
+        fulfillment_status:if status=="fulfilled"{"completed"}else if status=="cancelled"{"cancelled"}else if status=="paid"{"pending"}else{"awaiting_payment"}.into(),
         order_id: row.get(0)?,
         order_no: row.get(1)?,
         customer_id: row.get(2)?,
@@ -3603,9 +3620,16 @@ fn get_order(connection: &Connection, order_id: &str) -> rusqlite::Result<Option
 }
 
 fn ai_employee_product_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiEmployeeProduct> {
-    let skill_ids_json: String = row.get(8)?;
-    let allowed_tools_json: String = row.get(11)?;
-    let application_ids_json: String = row.get(12)?;
+    let skill_ids_json: String = row.get(7)?;
+    let allowed_tools_json: String = row.get(10)?;
+    let application_ids_json: String = row.get(11)?;
+    let mut allowed_tools: Vec<String> = serde_json::from_str(&allowed_tools_json).unwrap_or_default();
+    if allowed_tools.iter().any(|tool| tool == "browser_read_page") {
+        allowed_tools.retain(|tool| tool != "browser_read_page");
+        if !allowed_tools.iter().any(|tool| tool == "browser_control") {
+            allowed_tools.push("browser_control".into());
+        }
+    }
     Ok(AiEmployeeProduct {
         id: row.get(0)?,
         title: row.get(1)?,
@@ -3614,23 +3638,22 @@ fn ai_employee_product_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiE
         price_cents: row.get(4)?,
         billing_cycle: row.get(5)?,
         version: row.get(6)?,
-        package_version: row.get(7)?,
         skill_ids: serde_json::from_str(&skill_ids_json).unwrap_or_default(),
-        system_prompt: row.get(9)?,
-        allow_network: row.get(10)?,
-        allowed_tools: serde_json::from_str(&allowed_tools_json).unwrap_or_default(),
+        system_prompt: row.get(8)?,
+        allow_network: row.get(9)?,
+        allowed_tools,
         application_ids: serde_json::from_str(&application_ids_json).unwrap_or_default(),
-        avatar_url: row.get(13)?,
-        status: row.get(14)?,
-        created_at: row.get(15)?,
-        updated_at: row.get(16)?,
+        avatar_url: row.get(12)?,
+        status: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
     })
 }
 
 fn load_ai_employee_products(connection: &Connection) -> rusqlite::Result<Vec<AiEmployeeProduct>> {
     let mut statement = connection.prepare(
         "SELECT id, title, description, category, price_cents, billing_cycle,
-                version, package_version, skill_ids_json, system_prompt, allow_network,
+                version, skill_ids_json, system_prompt, allow_network,
                 allowed_tools_json, application_ids_json, avatar_url, status, created_at, updated_at
          FROM ai_employee_products ORDER BY updated_at DESC",
     )?;
@@ -3646,7 +3669,7 @@ fn get_ai_employee_product(
     connection
         .query_row(
             "SELECT id, title, description, category, price_cents, billing_cycle,
-                    version, package_version, skill_ids_json, system_prompt, allow_network,
+                    version, skill_ids_json, system_prompt, allow_network,
                     allowed_tools_json, application_ids_json, avatar_url, status, created_at, updated_at
              FROM ai_employee_products WHERE id = ?",
             [employee_id],
@@ -3687,55 +3710,38 @@ fn version_parts(version: &str) -> (u64, u64, u64) {
     )
 }
 
-fn package_version_from_versions<'a>(versions: impl IntoIterator<Item = &'a str>) -> String {
-    let package = versions
-        .into_iter()
-        .map(version_parts)
-        .fold((0_u64, 0_u64, 0_u64), |sum, item| {
-            (sum.0 + item.0, sum.1 + item.1, sum.2 + item.2)
-        });
-    format!("{}.{}.{}", package.0, package.1, package.2)
-}
-
-fn refresh_ai_employee_package_version(
-    connection: &Connection,
-    employee_id: &str,
-    updated_at: i64,
-) -> rusqlite::Result<()> {
-    let Some(product) = get_ai_employee_product(connection, employee_id)? else {
-        return Ok(());
-    };
-    let mut skill_ids = product.skill_ids.clone();
-    skill_ids.sort();
-    skill_ids.dedup();
-    let mut versions = vec![product.version.clone()];
-    for skill_id in skill_ids {
-        if let Some(skill) = get_operation_skill(connection, &skill_id)? {
-            versions.push(skill.version);
-        }
-    }
-    let package_version = package_version_from_versions(versions.iter().map(String::as_str));
-    connection.execute(
-        "UPDATE ai_employee_products SET package_version = ?, updated_at = ? WHERE id = ?",
-        params![package_version, updated_at, employee_id],
-    )?;
-    Ok(())
-}
-
-fn refresh_ai_employee_package_versions_for_skill(
+fn bump_employee_versions_for_skill(
     connection: &Connection,
     skill_id: &str,
     updated_at: i64,
 ) -> rusqlite::Result<()> {
     for product in load_ai_employee_products(connection)? {
         if product.skill_ids.iter().any(|id| id == skill_id) {
-            refresh_ai_employee_package_version(connection, &product.id, updated_at)?;
+            connection.execute(
+                "UPDATE ai_employee_products SET version = ?, updated_at = ? WHERE id = ?",
+                params![next_patch_version(&product.version), updated_at, product.id],
+            )?;
         }
     }
     Ok(())
 }
 
 fn operation_skill_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationSkill> {
+    let package_path: String = row.get(5)?;
+    let instructions: String = row.get(7)?;
+    let environment_variables = skill_environment::discover(&package_path, &instructions);
+    let mut environment_values: BTreeMap<String, String> =
+        serde_json::from_str(&row.get::<_, String>(14)?).unwrap_or_default();
+    // Preserve the old address only when this package actually consumes that variable.
+    let legacy: String = row.get(13)?;
+    if !legacy.is_empty() && !environment_values.contains_key("COMPONENT_LIBRARY_API_URL") {
+        environment_values.insert("COMPONENT_LIBRARY_API_URL".into(), legacy);
+    }
+    environment_values.retain(|name, _| {
+        environment_variables
+            .iter()
+            .any(|variable| variable.name == *name)
+    });
     Ok(OperationSkill {
         id: row.get(0)?,
         title: row.get(1)?,
@@ -3745,6 +3751,8 @@ fn operation_skill_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Operati
         package_path: row.get(5)?,
         description: row.get(6)?,
         instructions: row.get(7)?,
+        environment_variables,
+        environment_values,
         status: row.get(10)?,
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
@@ -3755,7 +3763,7 @@ fn load_operation_skills(connection: &Connection) -> rusqlite::Result<Vec<Operat
     let mut statement = connection.prepare(
         "SELECT id, title, package_name, source, version, package_path,
                 description, instructions, allowed_tools_json, application_ids_json,
-                status, created_at, updated_at
+                status, created_at, updated_at, component_library_api_url, environment_values_json
          FROM operation_skills ORDER BY updated_at DESC",
     )?;
     statement.query_map([], operation_skill_from_row)?.collect()
@@ -3769,7 +3777,7 @@ fn get_operation_skill(
         .query_row(
             "SELECT id, title, package_name, source, version, package_path,
                 description, instructions, allowed_tools_json, application_ids_json,
-                status, created_at, updated_at
+                status, created_at, updated_at, component_library_api_url, environment_values_json
          FROM operation_skills WHERE id = ?",
             [skill_id],
             operation_skill_from_row,
@@ -3797,6 +3805,29 @@ fn validate_active_skills(
 
 fn platform_tool_catalog() -> Vec<PlatformTool> {
     vec![
+        platform_tool("knowledge_search", "检索知识库", "检索当前用户授权和任务快照内的知识资料，返回带版本与位置的来源；实际关键词、混合及重排模式以运行结果为准。", "knowledge", "read"),
+        platform_tool("knowledge_read_document", "读取知识来源", "按本轮检索返回的引用读取有界原文，并重新校验用户权限。", "knowledge", "read"),
+        platform_tool(
+            "browser_control",
+            "操作浏览器",
+            "在桌面端通过 CDP 操作 Chrome / Edge，支持导航、读取、点击、填写、按键、滚动和截图；写操作遵循会话审批模式。",
+            "skill",
+            "execution",
+        ),
+        platform_tool(
+            "skill_run_script",
+            "运行 Skill 脚本",
+            "在当前系统账户下运行已关联 Skill 脚本；没有系统级沙箱。依赖安装需另有终端执行能力。",
+            "skill",
+            "execution",
+        ),
+        platform_tool(
+            "workspace_execute_code",
+            "执行代码与终端命令",
+            "允许会话内 Python、Node 和终端命令，包括按需 pip/npm 安装；当前账户执行，无系统级隔离，不额外弹出依赖安装确认。",
+            "skill",
+            "execution",
+        ),
         platform_tool(
             "list_apps",
             "读取应用列表",
@@ -3824,13 +3855,6 @@ fn platform_tool_catalog() -> Vec<PlatformTool> {
             "永久删除低代码应用及其资源，始终要求人工确认。",
             "app",
             "destructive",
-        ),
-        platform_tool(
-            "get_application_business_context",
-            "读取应用业务地图",
-            "读取应用说明、表单、字段摘要、关联关系和明细父表关系。",
-            "app",
-            "read",
         ),
         platform_tool(
             "list_forms",
@@ -3870,7 +3894,7 @@ fn platform_tool_catalog() -> Vec<PlatformTool> {
         platform_tool(
             "get_form_schema_contract",
             "读取表单 Schema 规范",
-            "读取平台通用表单 Schema 结构、字段布局和表单类型规则；没有参考表单时用于设计新表单。",
+            "读取当前平台表单结构与规范。V2 配套提供只读组件目录及精确合同查询，无需预先创建参考表单或知识库。",
             "form",
             "read",
         ),
@@ -3926,7 +3950,7 @@ fn platform_tool_catalog() -> Vec<PlatformTool> {
         platform_tool(
             "create_form",
             "创建表单",
-            "创建空白表单；还要求运行时允许创建表单。",
+            "创建表单；可选 schema 同时校验并事务保存初始字段/布局，不传则创建空白表单。传 schema 还要求开发视图、编辑及关联资源权限；流程图另行配置。",
             "form",
             "write",
         ),
@@ -3948,6 +3972,13 @@ fn platform_tool_catalog() -> Vec<PlatformTool> {
             "save_form_schema",
             "保存表单 Schema",
             "保存表单 Schema 后立即成为当前版本。",
+            "form",
+            "write",
+        ),
+        platform_tool(
+            "yaya_apply_design_patch",
+            "修改表单设计",
+            "修改普通表单或工作流表单设计；按当前用户 RBAC 校验，所有修改均须用户确认。",
             "form",
             "write",
         ),
@@ -3974,8 +4005,15 @@ fn platform_tool_catalog() -> Vec<PlatformTool> {
         ),
         platform_tool(
             "create_automation_draft",
-            "创建自动化草稿",
-            "创建待确认的事件自动化草稿，确认后保持 draft 状态。",
+            "创建集成自动化",
+            "预览并确认后创建处于暂停状态的集成自动化；不启用、不执行。V2 提供配套的只读节点规范及纯设计校验。",
+            "automation",
+            "write",
+        ),
+        platform_tool(
+            "yaya_update_automation",
+            "修改集成自动化设计",
+            "基于当前版本预览并确认后修改已暂停的集成自动化节点和连线；不修改审批流程，不启用或试运行。",
             "automation",
             "write",
         ),
@@ -3992,6 +4030,13 @@ fn platform_tool_catalog() -> Vec<PlatformTool> {
             "读取工作流表单的流程节点和连线。",
             "workflow",
             "read",
+        ),
+        platform_tool(
+            "yaya_save_workflow_process",
+            "配置审批流程设计",
+            "读取规范和真实成员/角色，校验后预览并确认保存流程表单的审批、执行、抄送及条件节点。保留启用状态；启用中的流程对后续提交立即生效，不提交记录、不代审批或试跑。",
+            "workflow",
+            "write",
         ),
         platform_tool(
             "get_workflow_record_runtime",
@@ -4023,7 +4068,7 @@ fn platform_tool(
 fn platform_tool_group(id: &str, category: &str) -> &'static str {
     match (category, id) {
         ("app", "create_app" | "update_app" | "delete_app") => "构建",
-        ("app", "list_apps" | "get_application_business_context") => "分析",
+        ("app", "list_apps") => "分析",
         (
             "form",
             "list_forms"
@@ -4372,7 +4417,7 @@ fn backfill_audit_log_customers(connection: &Connection) -> rusqlite::Result<()>
 
 fn list_audit_log_records(
     database_path: &PathBuf,
-    limit: u32,
+    query: &AuditLogQuery,
 ) -> rusqlite::Result<Vec<AuditLogRecord>> {
     let connection = Connection::open(database_path)?;
     let mut statement = connection.prepare(
@@ -4380,12 +4425,26 @@ fn list_audit_log_records(
                 status_code, duration_ms, user_agent, response_body, customer_id,
                 COALESCE(NULLIF(customer_name, ''), '无客户')
          FROM audit_logs
-         WHERE path IS NULL OR path <> '/api/logs'
+         WHERE (path IS NULL OR path <> '/api/logs')
+           AND (:before IS NULL OR id < :before)
+           AND (:start IS NULL OR created_at >= :start)
+           AND (:end IS NULL OR created_at < :end)
+           AND (:level IS NULL OR level = :level)
+           AND (:customer IS NULL OR customer_id = :customer OR (:customer = '__none__' AND (customer_id IS NULL OR customer_id = '')))
+           AND (:search = '' OR instr(lower(COALESCE(message,'') || ' ' || COALESCE(path,'') || ' ' || COALESCE(customer_name,'') || ' ' || COALESCE(endpoint_title,'') || ' ' || COALESCE(source,'') || ' ' || COALESCE(ip_address,'') || ' ' || COALESCE(status_code,'')), lower(:search)) > 0)
          ORDER BY id DESC
-         LIMIT ?",
+         LIMIT :limit",
     )?;
     statement
-        .query_map(params![limit], |row| {
+        .query_map(rusqlite::named_params! {
+            ":limit": query.limit.unwrap_or(300).clamp(1, 1000),
+            ":before": query.before,
+            ":start": query.start,
+            ":end": query.end,
+            ":level": query.level,
+            ":customer": query.customer_id,
+            ":search": query.search.as_deref().unwrap_or("").trim(),
+        }, |row| {
             Ok(AuditLogRecord {
                 id: row.get(0)?,
                 created_at: row.get(1)?,
@@ -4526,7 +4585,6 @@ fn initialize_database(
                 price_cents INTEGER NOT NULL,
                 billing_cycle TEXT NOT NULL DEFAULT 'year',
                 version TEXT NOT NULL DEFAULT '1.0.0',
-                package_version TEXT NOT NULL DEFAULT '1.0.0',
                 skill_ids_json TEXT NOT NULL DEFAULT '[]',
                 system_prompt TEXT NOT NULL DEFAULT '',
                 allow_network INTEGER NOT NULL DEFAULT 0,
@@ -4551,6 +4609,38 @@ fn initialize_database(
                 review_reason TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_application_releases_status ON application_releases(status, submitted_at DESC);
+            CREATE TABLE IF NOT EXISTS application_products (
+                product_id TEXT PRIMARY KEY NOT NULL,
+                publisher_subject TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active'
+            );
+            CREATE TABLE IF NOT EXISTS application_listing_versions (
+                product_id TEXT PRIMARY KEY NOT NULL,
+                release_id TEXT NOT NULL,
+                listing_status TEXT NOT NULL DEFAULT 'withdrawn',
+                published_at INTEGER,
+                withdrawn_at INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS application_download_tickets (
+                ticket TEXT PRIMARY KEY NOT NULL,
+                release_id TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                used_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_application_download_tickets_expiry ON application_download_tickets(expires_at);
+            CREATE TABLE IF NOT EXISTS application_entitlements (
+                subject TEXT NOT NULL,
+                product_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                expires_at INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(subject, product_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_application_entitlements_product ON application_entitlements(product_id, status);
             CREATE TABLE IF NOT EXISTS operation_skills (
                 id TEXT PRIMARY KEY NOT NULL,
                 title TEXT NOT NULL,
@@ -4592,6 +4682,14 @@ fn initialize_database(
             ",
         )
         .map_err(|error| error.to_string())?;
+    let has_primary_member = connection.prepare("PRAGMA table_info(application_products)")
+        .map_err(|e| e.to_string())?.query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        .iter().any(|name| name == "publisher_app_id");
+    if has_primary_member {
+        connection.execute_batch("ALTER TABLE application_products DROP COLUMN publisher_app_id;").map_err(|e| e.to_string())?;
+    }
+    application_commerce::initialize(&connection)?;
     let user_count: i64 = connection
         .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
         .map_err(|error| error.to_string())?;
@@ -4630,6 +4728,7 @@ fn initialize_database(
             .to_string();
         connection.execute("INSERT INTO users (user_id, username, password_hash, display_name, role, organization_id, status, created_at) VALUES (?, ?, ?, '平台超级管理员', 'platform_admin', 'platform', 'active', ?)", params![generated_resource_id("usr"), initial_admin_username, password_hash, Utc::now().timestamp()]).map_err(|error| error.to_string())?;
     }
+    employee_knowledge::migrate(&connection).map_err(|e| e.to_string())?;
     remove_persona_schema(&connection)?;
     remove_skill_legacy_schema(&connection)?;
     ensure_column(
@@ -4683,12 +4782,6 @@ fn initialize_database(
     ensure_column(
         &connection,
         "ai_employee_products",
-        "package_version",
-        "ALTER TABLE ai_employee_products ADD COLUMN package_version TEXT NOT NULL DEFAULT '1.0.0'",
-    )?;
-    ensure_column(
-        &connection,
-        "ai_employee_products",
         "skill_ids_json",
         "ALTER TABLE ai_employee_products ADD COLUMN skill_ids_json TEXT NOT NULL DEFAULT '[]'",
     )?;
@@ -4721,6 +4814,18 @@ fn initialize_database(
         "ai_employee_products",
         "avatar_url",
         "ALTER TABLE ai_employee_products ADD COLUMN avatar_url TEXT",
+    )?;
+    ensure_column(
+        &connection,
+        "operation_skills",
+        "environment_values_json",
+        "ALTER TABLE operation_skills ADD COLUMN environment_values_json TEXT NOT NULL DEFAULT '{}'",
+    )?;
+    ensure_column(
+        &connection,
+        "operation_skills",
+        "component_library_api_url",
+        "ALTER TABLE operation_skills ADD COLUMN component_library_api_url TEXT NOT NULL DEFAULT ''",
     )?;
     ensure_column(
         &connection,
@@ -4801,11 +4906,8 @@ fn initialize_database(
             .map_err(|error| error.to_string())?;
     }
     migrate_license_relation_schema(&mut connection)?;
-    for product in load_ai_employee_products(&connection).map_err(|error| error.to_string())? {
-        refresh_ai_employee_package_version(&connection, &product.id, product.updated_at)
-            .map_err(|error| error.to_string())?;
-    }
     // Keep application release schema up to date even when license data is already initialized.
+    ensure_column(&connection,"application_releases","product_id","ALTER TABLE application_releases ADD COLUMN product_id TEXT")?;
     ensure_column(
         &connection,
         "application_releases",
@@ -4827,6 +4929,7 @@ fn initialize_database(
         )
         .map_err(|error| error.to_string())?;
     if record_count != 0 {
+        licensing::initialize(&mut connection)?;
         backfill_audit_log_customers(&connection).map_err(|error| error.to_string())?;
         return Ok(());
     }
@@ -4853,6 +4956,7 @@ fn initialize_database(
         }
     }
     transaction.commit().map_err(|error| error.to_string())?;
+    licensing::initialize(&mut connection)?;
     backfill_audit_log_customers(&connection).map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -5027,25 +5131,6 @@ fn migrate_license_relation_schema(connection: &mut Connection) -> Result<(), St
     Ok(())
 }
 
-fn insert_issued_license(database_path: &PathBuf, license: &LicenseRecord) -> rusqlite::Result<()> {
-    let mut connection = Connection::open(database_path)?;
-    let transaction = connection.transaction()?;
-    insert_license_into_connection(&transaction, license)?;
-    let order_id = license
-        .order_id
-        .as_deref()
-        .ok_or(rusqlite::Error::InvalidQuery)?;
-    let updated = transaction.execute(
-        "UPDATE orders SET status = 'fulfilled', license_id = ?
-         WHERE order_id = ? AND status = 'paid' AND license_id IS NULL",
-        params![license.license_id, order_id],
-    )?;
-    if updated != 1 {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
-    }
-    transaction.commit()
-}
-
 fn insert_license_into_connection(
     connection: &Connection,
     license: &LicenseRecord,
@@ -5139,20 +5224,6 @@ fn get_license_record(
         .optional()
 }
 
-fn update_license_record(database_path: &PathBuf, license: &LicenseRecord) -> rusqlite::Result<()> {
-    let connection = Connection::open(database_path)?;
-    connection.execute(
-        "UPDATE licenses SET platform_status = ?, module_statuses_json = ? WHERE license_id = ?",
-        params![
-            license.platform_status,
-            serde_json::to_string(&license.module_statuses)
-                .expect("module statuses are serializable"),
-            license.license_id,
-        ],
-    )?;
-    Ok(())
-}
-
 // Activating the latest signature replaces every older signature for this subject.
 // The transaction prevents two platform instances from leaving multiple active licenses.
 fn activate_latest_license_record(
@@ -5161,15 +5232,8 @@ fn activate_latest_license_record(
 ) -> rusqlite::Result<bool> {
     let mut connection = Connection::open(database_path)?;
     let transaction = connection.transaction()?;
-    let latest_license_id = transaction
-        .query_row(
-            "SELECT license_id FROM licenses
-             WHERE subject = ? AND linkage_status = 'linked' AND platform_status <> 'destroyed'
-             ORDER BY issued_at DESC, license_id DESC LIMIT 1",
-            params![license.subject],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
+    let latest_license_id = licensing::latest(&transaction,&license.subject)?.map(|v|v.license_id)
+        .or(transaction.query_row("SELECT license_id FROM licenses WHERE subject=? AND linkage_status='linked' AND platform_status<>'destroyed' ORDER BY issued_at DESC,license_id DESC LIMIT 1",[&license.subject],|r|r.get::<_,String>(0)).optional()?);
     if latest_license_id.as_deref() != Some(license.license_id.as_str()) {
         return Ok(false);
     }
@@ -5188,37 +5252,9 @@ fn activate_latest_license_record(
         return Ok(false);
     }
 
-    let mut previous_statement = transaction.prepare(
-        "SELECT license_id, modules_json, module_statuses_json FROM licenses
-         WHERE subject = ? AND license_id <> ? AND linkage_status = 'linked'
-           AND platform_status <> 'destroyed'",
-    )?;
-    let previous = previous_statement
-        .query_map(params![license.subject, license.license_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(previous_statement);
-    for (license_id, modules_json, statuses_json) in previous {
-        let modules = serde_json::from_str::<Vec<String>>(&modules_json).unwrap_or_default();
-        let mut statuses =
-            serde_json::from_str::<HashMap<String, String>>(&statuses_json).unwrap_or_default();
-        for module in modules {
-            statuses.insert(module, "destroyed".to_string());
-        }
-        transaction.execute(
-            "UPDATE licenses SET platform_status = 'destroyed', module_statuses_json = ?
-             WHERE license_id = ? AND platform_status <> 'destroyed'",
-            params![
-                serde_json::to_string(&statuses).expect("module statuses are serializable"),
-                license_id,
-            ],
-        )?;
-    }
+    // Historical signatures remain immutable. Supersession belongs to authorization versions.
+    let mapped:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM authorization_versions WHERE license_id=?)",[&license.license_id],|r|r.get(0))?;
+    if mapped && !licensing::activate(&transaction,license)? {return Ok(false);}
     transaction.commit()?;
     Ok(true)
 }
@@ -5298,7 +5334,113 @@ fn error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<En
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn new_customer_requires_unique_nonempty_name_and_phone() {
+        use super::*;
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE customers(name TEXT, contact_phone TEXT, status TEXT);
+             INSERT INTO customers VALUES (' 已有客户 ', ' 13800000000 ', 'inactive');"
+        ).unwrap();
+        for (name, phone, status, message) in [
+            (" ", "13900000000", StatusCode::BAD_REQUEST, "客户名称不能为空"),
+            ("新客户", " ", StatusCode::BAD_REQUEST, "联系电话（手机号）不能为空"),
+            (" 已有客户 ", "13900000000", StatusCode::CONFLICT, "客户名称已存在，请勿重复创建"),
+            ("新客户", " 13800000000 ", StatusCode::CONFLICT, "联系电话（手机号）已存在，请勿重复创建"),
+        ] {
+            let failure = validate_new_customer(&connection, name, phone).unwrap_err();
+            assert_eq!(failure.0, status);
+            assert_eq!(failure.1.0.message, message);
+        }
+        assert!(validate_new_customer(&connection, "新客户", "13900000000").is_ok());
+    }
+
     use super::*;
+
+    #[test]
+    fn migrates_environment_configuration_and_preserves_package_values() {
+        let root = std::env::temp_dir().join(format!("skill-env-db-{}", Uuid::new_v4()));
+        let database = root.join("catalog.sqlite");
+        let missing = root.join("missing.json");
+        let initialize = || {
+            initialize_database(
+                &database,
+                &missing,
+                &missing,
+                "admin",
+                Some("test-only-password"),
+            )
+        };
+        initialize().unwrap();
+        {
+            let connection = Connection::open(&database).unwrap();
+            connection.execute_batch("ALTER TABLE operation_skills DROP COLUMN environment_values_json;
+                INSERT INTO operation_skills (id,title,instructions,created_at,updated_at,component_library_api_url)
+                VALUES ('generic','Generic','os.getenv(''CUSTOM_URL'')',1,1,'http://wrong.example');").unwrap();
+        }
+        initialize().unwrap();
+        initialize().unwrap();
+        {
+            let connection = Connection::open(&database).unwrap();
+            let skill = get_operation_skill(&connection, "generic")
+                .unwrap()
+                .unwrap();
+            assert_eq!(skill.environment_variables[0].name, "CUSTOM_URL");
+            assert!(skill.environment_values.is_empty()); // No legacy address leaking into unrelated skills.
+            let request: SaveOperationSkillRequest = serde_json::from_value(serde_json::json!({
+                "id":"generic", "title":"Generic", "instructions":"os.getenv('CUSTOM_URL')",
+                "environmentValues":{"CUSTOM_URL":"https://example.com"}
+            }))
+            .unwrap();
+            let values = request.environment_values.unwrap();
+            skill_environment::validate_values(&skill.environment_variables, &values).unwrap();
+            connection
+                .execute(
+                    "UPDATE operation_skills SET environment_values_json=? WHERE id=?",
+                    params![serde_json::to_string(&values).unwrap(), request.id],
+                )
+                .unwrap();
+            let skill = get_operation_skill(&connection, "generic")
+                .unwrap()
+                .unwrap();
+            let snapshot = serde_json::to_value(OperationSkillSnapshot::from(skill)).unwrap();
+            assert_eq!(
+                snapshot["environmentValues"]["CUSTOM_URL"],
+                "https://example.com"
+            );
+            assert!(snapshot.get("componentLibraryApiUrl").is_none());
+            connection.execute("UPDATE operation_skills SET instructions='no environment dependencies' WHERE id='generic'", []).unwrap();
+            let updated = get_operation_skill(&connection, "generic")
+                .unwrap()
+                .unwrap();
+            assert!(updated.environment_variables.is_empty());
+            assert!(updated.environment_values.is_empty());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn employee_catalog_contains_explicit_design_patch_capability() {
+        let tools = platform_tool_catalog();
+        let patch = tools
+            .iter()
+            .find(|tool| tool.id == "yaya_apply_design_patch")
+            .unwrap();
+        assert_eq!(patch.risk_level, "write");
+        assert!(patch.description.contains("确认"));
+        let ids: std::collections::HashSet<_> = tools.iter().map(|tool| &tool.id).collect();
+        assert_eq!(ids.len(), tools.len());
+    }
+
+    #[test]
+    fn employee_catalog_exposes_explicit_local_execution_capabilities() {
+        let tools=platform_tool_catalog();
+        for id in ["skill_run_script","workspace_execute_code"] {
+            let tool=tools.iter().find(|tool|tool.id==id).unwrap();
+            assert_eq!(tool.risk_level,"execution");
+            assert!(tool.description.contains("账户"));
+        }
+    }
 
     #[test]
     fn removes_legacy_skill_configuration_columns() {
@@ -5375,26 +5517,31 @@ mod tests {
     }
 
     #[test]
-    fn package_version_sums_each_version_component_without_carrying() {
-        assert_eq!(
-            package_version_from_versions(["1.0.3", "1.0.7", "2.6.5"]),
-            "4.6.15"
-        );
-    }
-
-    #[test]
-    fn remaining_days_rounds_up_and_never_returns_zero() {
-        assert_eq!(remaining_days(86_400, 0), 1);
-        assert_eq!(remaining_days(86_401, 0), 2);
-        assert_eq!(remaining_days(0, 0), 1);
+    fn skill_changes_increment_only_bound_employee_versions() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE ai_employee_products (
+            id TEXT PRIMARY KEY,title TEXT,description TEXT,category TEXT,price_cents INTEGER,
+            billing_cycle TEXT,version TEXT,skill_ids_json TEXT,system_prompt TEXT,
+            allow_network INTEGER,allowed_tools_json TEXT,application_ids_json TEXT,
+            avatar_url TEXT,status TEXT,created_at INTEGER,updated_at INTEGER);
+            INSERT INTO ai_employee_products VALUES
+            ('bound','BOM','','',0,'year','1.1.7','[\"bom\"]','',0,'[]','[]',NULL,'active',0,0),
+            ('other','Other','','',0,'year','1.0.0','[]','',0,'[]','[]',NULL,'active',0,0);").unwrap();
+        bump_employee_versions_for_skill(&connection, "bom", 42).unwrap();
+        let bound = get_ai_employee_product(&connection, "bound").unwrap().unwrap();
+        assert_eq!(bound.version, "1.1.8");
+        assert_eq!(bound.updated_at, 42);
+        assert_eq!(get_ai_employee_product(&connection, "other").unwrap().unwrap().version, "1.0.0");
+        assert!(serde_json::to_value(bound).unwrap().get("packageVersion").is_none());
     }
 
     #[test]
     fn audit_response_redacts_sensitive_fields() {
-        let body = br#"{"message":"ok","data":{"license":"signed-token","licenseId":"lic_1","apiKey":"secret"}}"#;
+        let body = br#"{"message":"ok","data":{"license":"signed-token","licenseId":"lic_1","apiKey":"secret","environmentValues":{"CUSTOM_CREDENTIAL":"do-not-log"}}}"#;
         let sanitized = sanitize_response_body(body).expect("JSON response");
         assert!(!sanitized.contains("signed-token"));
         assert!(!sanitized.contains("\"secret\""));
+        assert!(!sanitized.contains("do-not-log"));
         assert!(sanitized.contains("lic_1"));
         assert!(sanitized.contains("[REDACTED]"));
     }
@@ -5543,7 +5690,7 @@ mod tests {
     }
 
     #[test]
-    fn activating_latest_license_destroys_older_subject_licenses() {
+    fn activating_latest_license_preserves_older_signature_history() {
         let database_path = std::env::temp_dir().join(format!(
             "yaya-operation-center-license-activation-{}.sqlite3",
             Uuid::new_v4().simple()
@@ -5588,6 +5735,9 @@ mod tests {
         let mut latest = make_license("lic_latest", "ord_latest", 2, "unactivated");
         insert_license_into_connection(&connection, &old).expect("insert old license");
         insert_license_into_connection(&connection, &latest).expect("insert latest license");
+        connection.execute_batch("CREATE TABLE customers(customer_id TEXT PRIMARY KEY);INSERT INTO customers VALUES('cus_1');CREATE TABLE orders(order_id TEXT PRIMARY KEY);INSERT INTO orders VALUES('ord_old'),('ord_latest');").unwrap();
+        let mut connection=connection;
+        licensing::initialize(&mut connection).unwrap();
         drop(connection);
 
         latest.platform_status = "running".to_string();
@@ -5612,7 +5762,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read latest status");
-        assert_eq!(old_status, "destroyed");
+        assert_eq!(old_status, "running");
         assert_eq!(latest_status, "running");
 
         drop(connection);
@@ -5621,3 +5771,9 @@ mod tests {
         let _ = std::fs::remove_file(database_path.with_extension("sqlite3-shm"));
     }
 }
+
+#[cfg(test)]
+mod application_market_tests;
+
+#[cfg(test)]
+mod application_commerce_tests;

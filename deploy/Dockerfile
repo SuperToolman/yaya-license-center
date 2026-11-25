@@ -8,6 +8,8 @@ ENV CARGO_HTTP_TIMEOUT=45 \
     CARGO_TERM_PROGRESS_WHEN=never
 COPY api/Cargo.toml api/Cargo.lock ./
 COPY api/src ./src
+COPY api/migrations ./migrations
+COPY crates/ops-protocol /workspace/crates/ops-protocol
 RUN cargo build --release --verbose
 
 FROM node:22-bookworm-slim AS web-builder
@@ -15,13 +17,23 @@ WORKDIR /workspace
 RUN corepack enable
 COPY pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY web/package.json web/package.json
+COPY web/patches ./web/patches
 RUN pnpm install --frozen-lockfile
 COPY web ./web
 ENV NEXT_PUBLIC_OPERATION_API_BASE_URL=/operation-api
 RUN pnpm --dir web build
 
+# Embed the backup utility as an offline image archive. Customer recovery never pulls images.
+FROM alpine:3.21 AS backup-helper
+FROM alpine:3.21 AS helper-export
+COPY --from=backup-helper / /helper-root/
+RUN tar -C /helper-root -cf /backup-helper-rootfs.tar .
+
 FROM node:22-bookworm-slim
 WORKDIR /app
+COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=helper-export /backup-helper-rootfs.tar /app/tools/backup-helper-rootfs.tar
+ENV YAYA_PLATFORM_DOCKER_CLI=/usr/local/bin/docker
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*

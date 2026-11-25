@@ -1,0 +1,20 @@
+diff --git a/dist/chunk-SUL6UUW2.js b/dist/chunk-SUL6UUW2.js
+--- a/dist/chunk-SUL6UUW2.js
++++ b/dist/chunk-SUL6UUW2.js
+@@ -640,4 +640,6 @@
+ var createClassResolver = (resolved, cn) => {
+   if (resolved.mode === "plain") return createPlainResolver(resolved, cn);
++  // Slot functions are retained by React useMemo: each call must capture its own props.
++  if (resolved.mode === "slots") return (props) => createSlotsResolver(resolved, cn)(props);
+   let resolver;
+   return ((props) => {
+diff --git a/dist/chunk-HIKWJRSK.cjs b/dist/chunk-HIKWJRSK.cjs
+--- a/dist/chunk-HIKWJRSK.cjs
++++ b/dist/chunk-HIKWJRSK.cjs
+@@ -642,4 +642,6 @@
+ var createClassResolver = (resolved, cn) => {
+   if (resolved.mode === "plain") return createPlainResolver(resolved, cn);
++  // Slot functions are retained by React useMemo: each call must capture its own props.
++  if (resolved.mode === "slots") return (props) => createSlotsResolver(resolved, cn)(props);
+   let resolver;
+   return ((props) => {

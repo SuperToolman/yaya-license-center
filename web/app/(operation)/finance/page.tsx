@@ -1,2 +1,4 @@
-import { FinancePage } from "../shared/components/ReadPages";
-export default FinancePage;
+import FinancePage from "./components/FinancePage";
+export default function Page() {
+  return <FinancePage />;
+}

@@ -2,7 +2,14 @@
 node_modules
 **/node_modules
 web/.next
+web/.next-test
+web/.next-build
+web/.patches
+web/test-results
+web/playwright-report
 api/target
+host-monitor/target
+crates/ops-protocol/target
 api/*.sqlite
 api/*.sqlite3
 api/*.log

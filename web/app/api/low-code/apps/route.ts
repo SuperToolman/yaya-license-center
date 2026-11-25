@@ -17,7 +17,10 @@ export async function GET(request: Request) {
     const body = await response.text();
     return new NextResponse(body, {
       status: response.status,
-      headers: { "content-type": response.headers.get("content-type") ?? "application/json" },
+      headers: {
+        "content-type":
+          response.headers.get("content-type") ?? "application/json",
+      },
     });
   } catch {
     return NextResponse.json(

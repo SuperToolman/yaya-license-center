@@ -1,2 +1,4 @@
-import { CommissionsPage } from "../shared/components/ReadPages";
-export default CommissionsPage;
+import CommissionsPage from "./components/CommissionsPage";
+export default function Page() {
+  return <CommissionsPage />;
+}
